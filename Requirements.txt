@@ -6,5 +6,9 @@ python-dotenv
 PyMuPDF
 sentence-transformers
 faiss-cpu
+<<<<<<< HEAD
 numpy
 deep-translator
+=======
+numpy
+>>>>>>> ad21eb3fdc6ed4df2ca931e16a30f74ee44f044a
