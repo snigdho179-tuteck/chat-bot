@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+requests
+python-dotenv
+PyMuPDF
+sentence-transformers
+faiss-cpu
+numpy
+deep-translator
