@@ -869,7 +869,7 @@
   </div>
 
   <script>
-    const API_BASE = `http://${window.location.hostname}:8000`;
+    const API_BASE = `http://${window.location.hostname}:5002`;
     const STORAGE_KEY = 'company_assistant_chats_v1';
     let lastInputWasVoice = false;
     const thread = document.getElementById('thread');
@@ -1270,7 +1270,7 @@
         }
       } catch (err) {
         pendingRequests.delete(requestChatId);
-        addMessageToChat(requestChatId, 'assistant', 'Could not reach the assistant backend. Check that it is running on port 8000.', true);
+        addMessageToChat(requestChatId, 'assistant', 'Could not reach the assistant backend. Check that it is running on port 5002.', true);
       } finally {
         renderSidebar();
         renderThread();
