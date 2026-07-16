@@ -14,6 +14,15 @@ Endpoints:
                       Refuses (without calling the model) if nothing relevant
                       is found in the handbook.
     GET  /health  -> liveness check for the API, the vector index, and llama.cpp.
+
+    Auth (see auth.py):
+        POST   /auth/signup      -> create an account (role: user | hr-employee | admin)
+        POST   /auth/login       -> log in, returns a JWT plus the account's role/status/tabs
+        GET    /auth/me          -> the caller's current role/status/panel-tab access
+        GET    /auth/users       -> list all users                         (admin only)
+        POST   /auth/users       -> create a user with a role/status/tabs  (admin only)
+        PUT    /auth/users/{id}  -> update a user's role/status/tabs       (admin only)
+        DELETE /auth/users/{id}  -> delete a user                          (admin only)
 """
 
 from __future__ import annotations
@@ -39,7 +48,9 @@ from backend import (
     logger,
     settings,
 )
-from rag import RAGInitializationError, RAGNotReadyError, rag_system
+from rag import RAGInitializationError, RAGNotReadyError, rag_manager
+from auth import init_db, router as auth_router
+from queries import init_db as init_queries_db, router as queries_router
 
 # --------------------------------------------------------------------------
 # App setup
@@ -52,14 +63,28 @@ async def lifespan(app: FastAPI):
     llama-server, and the frontend static file server — and tears them
     back down on exit.
     """
-    logger.info("Starting up: initializing RAG system...")
+    logger.info("Starting up: initializing auth database...")
     try:
-        rag_system.initialize()
-    except RAGInitializationError as exc:
-        logger.error("Failed to initialize RAG system: %s", exc)
+        init_db()
+    except Exception as exc:  # noqa: BLE001 - never let this block API startup
+        logger.error("Failed to initialize auth database: %s", exc)
+        logger.error("The API will still start, but /auth routes may fail.")
+
+    logger.info("Starting up: initializing unanswered-queries database...")
+    try:
+        init_queries_db()
+    except Exception as exc:  # noqa: BLE001 - never let this block API startup
+        logger.error("Failed to initialize queries database: %s", exc)
+        logger.error("The API will still start, but /queries routes may fail.")
+
+    logger.info("Starting up: initializing RAG systems (one per department)...")
+    try:
+        rag_manager.initialize_all()
+    except Exception as exc:  # noqa: BLE001 - never let this block API startup
+        logger.error("Failed to initialize RAG systems: %s", exc)
         logger.error(
             "The API will still start, but /chat will refuse all questions "
-            "until the vector index is loaded."
+            "for departments whose index failed to load."
         )
 
     logger.info("Starting up: bringing up llama-server...")
@@ -107,6 +132,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Auth routes: POST /auth/signup, POST /auth/login
+app.include_router(auth_router)
+
+# Unanswered-queries routes: POST/GET/PATCH/DELETE /queries
+app.include_router(queries_router)
+
 
 # --------------------------------------------------------------------------
 # Routes
@@ -114,9 +145,11 @@ app.add_middleware(
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health() -> HealthResponse:
-    """Health check for the API, the RAG vector index, and llama-server."""
+    """Health check for the API, each department's RAG vector index, and llama-server."""
     llama_status = "ok" if llama_process_manager.is_healthy() else "unreachable"
-    return HealthResponse(status="ok", vector_index=rag_system.status, llama_server=llama_status)
+    per_department = rag_manager.status_summary()
+    vector_index_summary = ", ".join(f"{dept}:{status_}" for dept, status_ in per_department.items())
+    return HealthResponse(status="ok", vector_index=vector_index_summary, llama_server=llama_status)
 
 
 @app.post(
@@ -137,10 +170,13 @@ async def chat(request: ChatRequest) -> ChatResponse:
     If RAG search finds nothing relevant, the model is never called and
     a fixed refusal message is returned instead.
     """
-    logger.info("Received /chat request: %r (language=%s)", request.message, request.language)
+    logger.info(
+        "Received /chat request: %r (language=%s, department=%s)",
+        request.message, request.language, request.department,
+    )
 
     try:
-        answer = generate_answer(request.message, language=request.language)
+        answer = generate_answer(request.message, language=request.language, department=request.department)
     except RAGNotReadyError as exc:
         logger.error("RAGNotReadyError while handling /chat: %s", exc)
         return JSONResponse(
@@ -176,7 +212,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
 if __name__ == "__main__":
     host = os.environ.get("APP_HOST", "0.0.0.0")
-    port = int(os.environ.get("APP_PORT", "8000"))
+    port = int(os.environ.get("APP_PORT", "5002"))
     reload = os.environ.get("APP_RELOAD", "false").lower() == "true"
 
     logger.info("Starting FastAPI app via __main__ on %s:%s", host, port)

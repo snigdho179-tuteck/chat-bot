@@ -19,6 +19,7 @@ reused for every request; it is never rebuilt on the fly.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -62,9 +63,31 @@ if not logger.handlers:
 class RAGSettings:
     """Static configuration for the RAG pipeline."""
 
-    # Path to the handbook PDF, relative to where main.py is launched from
-    # (project/backend/). Override via .env if your PDF lives elsewhere.
-    PDF_PATH: str = os.environ.get("RAG_PDF_PATH", "../data/Employee_Handbook.pdf")
+    # Root folder containing one subfolder per department, e.g.
+    #   data/hr/Employee_Handbook.pdf
+    #   data/marketing/Marketing_Playbook.pdf
+    #   data/finance/Finance_Policy.pdf
+    #   data/sales/Sales_Handbook.pdf
+    # Every PDF placed in a department's folder (by the admin, via File
+    # Management) is indexed for that department. Override via .env if
+    # your data lives elsewhere.
+    DATA_ROOT: str = os.environ.get("RAG_DATA_ROOT", "../data")
+
+    # Which department tabs exist. The frontend's chat tab list and the
+    # admin's File Management tab should match these slugs. "hr" ships
+    # first; add more here (or via .env, comma-separated) as new
+    # department documents come online.
+    DEPARTMENTS: List[str] = [
+        d.strip() for d in os.environ.get("RAG_DEPARTMENTS", "hr,marketing,finance,sales").split(",")
+        if d.strip()
+    ]
+    DEFAULT_DEPARTMENT: str = os.environ.get("RAG_DEFAULT_DEPARTMENT", "hr")
+
+    # Backward-compat: the original single-file layout. If a department's
+    # own folder (DATA_ROOT/<department>/) doesn't exist yet, the "hr"
+    # department falls back to this single PDF so existing deployments
+    # keep working unchanged.
+    LEGACY_HR_PDF_PATH: str = os.environ.get("RAG_PDF_PATH", "../data/Employee_Handbook.pdf")
 
     # Larger than the original 500/100. Small chunk sizes were splitting
     # enumerated lists (e.g. the 6 types of leave) across two overlapping
@@ -109,6 +132,10 @@ class RAGInitializationError(RAGError):
 
 class RAGNotReadyError(RAGError):
     """Raised when search_context() is called before the index has been built."""
+
+
+class RAGDepartmentNotFoundError(RAGError):
+    """Raised when a chat/report request names a department that isn't configured."""
 
 
 # --------------------------------------------------------------------------
@@ -397,6 +424,15 @@ def expand_query_for_retrieval(question: str) -> str:
     return "\n".join([question, *unique_expansions])
 
 
+def _format_qa_chunk(question: str, answer: str) -> str:
+    """
+    Format an answered query as a single retrievable chunk. Keeping the
+    question text in the chunk (not just the answer) is what lets future
+    rephrasings of the same question still match it semantically.
+    """
+    return f"[Answered question]\nQ: {question}\nA: {answer}"
+
+
 # --------------------------------------------------------------------------
 # RAG system
 # --------------------------------------------------------------------------
@@ -412,14 +448,22 @@ class RAGSystem:
 
     def __init__(
         self,
-        pdf_path: str = rag_settings.PDF_PATH,
+        department: str,
+        pdf_dir: str,
+        learned_qa_path: str,
+        legacy_pdf_path: Optional[str] = None,
         chunk_size: int = rag_settings.CHUNK_SIZE,
         chunk_overlap: int = rag_settings.CHUNK_OVERLAP,
         embedding_model_name: str = rag_settings.EMBEDDING_MODEL_NAME,
         top_k: int = rag_settings.TOP_K,
         similarity_threshold: float = rag_settings.SIMILARITY_THRESHOLD,
     ) -> None:
-        self.pdf_path = pdf_path
+        self.department = department
+        self.pdf_dir = pdf_dir
+        self.learned_qa_path = learned_qa_path
+        # Only "hr" uses this, and only if pdf_dir has nothing in it yet —
+        # keeps pre-existing single-PDF deployments working unmodified.
+        self.legacy_pdf_path = legacy_pdf_path
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.embedding_model_name = embedding_model_name
@@ -432,6 +476,10 @@ class RAGSystem:
         self._embedding_model: Optional[SentenceTransformer] = None
         self._index: Optional[faiss.Index] = None
         self._chunks: List[str] = []
+        # Which chunk indices came from answered-query training rather than
+        # an uploaded document — not currently used for special-casing
+        # retrieval, but kept for introspection/debugging.
+        self._qa_chunk_count: int = 0
 
         self._status: str = "not_loaded"  # "not_loaded" | "loaded" | "error"
         self._last_error: Optional[str] = None
@@ -455,6 +503,11 @@ class RAGSystem:
     def chunk_count(self) -> int:
         return len(self._chunks)
 
+    @property
+    def qa_chunk_count(self) -> int:
+        """How many of the current chunks came from answered queries."""
+        return self._qa_chunk_count
+
     # ---- initialization (build once at startup) ----
 
     def initialize(self) -> None:
@@ -472,14 +525,34 @@ class RAGSystem:
             return
 
         try:
-            logger.info("Loading employee handbook...")
-            segments = extract_segments_from_pdf(self.pdf_path)
+            pdf_paths = self._discover_pdfs()
+            if not pdf_paths:
+                raise RAGInitializationError(
+                    f"No PDFs found for department '{self.department}' "
+                    f"(looked in '{self.pdf_dir}'). Upload a document via "
+                    "File Management for this department first."
+                )
 
-            logger.info("Building vector index...")
+            logger.info("Loading %d document(s) for department '%s'...", len(pdf_paths), self.department)
+            segments: List[Tuple[str, str]] = []
+            for pdf_path in pdf_paths:
+                segments.extend(extract_segments_from_pdf(pdf_path))
+
+            logger.info("Building vector index for department '%s'...", self.department)
             chunks = chunk_segments(segments, self.chunk_size, self.chunk_overlap)
+
+            # Fold in every previously-answered query for this department so
+            # they get re-indexed on every restart, not just kept in memory.
+            learned_chunks = [
+                _format_qa_chunk(entry["question"], entry["answer"])
+                for entry in self._load_learned_qa()
+            ]
+            chunks.extend(learned_chunks)
+
             if not chunks:
                 raise RAGInitializationError(
-                    "Handbook produced zero chunks — check CHUNK_SIZE/CHUNK_OVERLAP."
+                    f"Department '{self.department}' produced zero chunks — "
+                    "check CHUNK_SIZE/CHUNK_OVERLAP or the source documents."
                 )
 
             model = SentenceTransformer(self.embedding_model_name)
@@ -497,25 +570,107 @@ class RAGSystem:
             self._embedding_model = model
             self._index = index
             self._chunks = chunks
+            self._qa_chunk_count = len(learned_chunks)
             self._status = "loaded"
             self._last_error = None
 
             logger.info(
-                "Vector index loaded successfully. (%d chunks, dim=%d)",
+                "Vector index loaded for department '%s'. (%d chunks total, %d from answered queries, dim=%d)",
+                self.department,
                 len(chunks),
+                len(learned_chunks),
                 dimension,
             )
 
         except RAGInitializationError as exc:
             self._status = "error"
             self._last_error = str(exc)
-            logger.error("RAG initialization failed: %s", exc)
+            logger.error("RAG initialization failed for department '%s': %s", self.department, exc)
             raise
         except Exception as exc:  # noqa: BLE001 - surface anything unexpected clearly
             self._status = "error"
             self._last_error = str(exc)
-            logger.exception("Unexpected error during RAG initialization")
+            logger.exception("Unexpected error during RAG initialization for department '%s'", self.department)
             raise RAGInitializationError(f"Unexpected error building the vector index: {exc}") from exc
+
+    def _discover_pdfs(self) -> List[str]:
+        """PDFs for this department: every *.pdf in pdf_dir, sorted for a
+        stable chunk order; falls back to the single legacy file (hr only)
+        if the department folder doesn't exist or is empty yet."""
+        dir_path = Path(self.pdf_dir)
+        if dir_path.is_dir():
+            found = sorted(str(p) for p in dir_path.glob("*.pdf"))
+            if found:
+                return found
+
+        if self.legacy_pdf_path and Path(self.legacy_pdf_path).is_file():
+            return [self.legacy_pdf_path]
+
+        return []
+
+    # ---- learning from answered queries ----
+
+    def _load_learned_qa(self) -> List[Dict[str, str]]:
+        path = Path(self.learned_qa_path)
+        if not path.is_file():
+            return []
+        entries: List[Dict[str, str]] = []
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning("Skipping malformed line in %s", path)
+                    continue
+                if entry.get("question") and entry.get("answer"):
+                    entries.append(entry)
+        return entries
+
+    def add_qa_pair(self, question: str, answer: str) -> None:
+        """
+        "Train" this department's bot with a newly-answered query: embed
+        the Q&A pair, append it to the live FAISS index immediately (so the
+        very next question can match it, no restart needed), and persist
+        it to disk so it survives restarts and gets folded back in by
+        initialize().
+        """
+        question = (question or "").strip()
+        answer = (answer or "").strip()
+        if not question or not answer:
+            return
+
+        if not self.is_ready:
+            # The index isn't built yet (e.g. this department has no PDF
+            # yet) — still persist the answer so it's picked up the moment
+            # the department is initialized.
+            self._append_learned_qa(question, answer)
+            return
+
+        chunk = _format_qa_chunk(question, answer)
+        assert self._embedding_model is not None and self._index is not None
+
+        embedding = self._embedding_model.encode(
+            [chunk], convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False,
+        ).astype("float32")
+
+        self._index.add(embedding)
+        self._chunks.append(chunk)
+        self._qa_chunk_count += 1
+        self._append_learned_qa(question, answer)
+
+        logger.info(
+            "Trained department '%s' with a newly-answered query (now %d QA chunks, %d total).",
+            self.department, self._qa_chunk_count, len(self._chunks),
+        )
+
+    def _append_learned_qa(self, question: str, answer: str) -> None:
+        path = Path(self.learned_qa_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"question": question, "answer": answer}) + "\n")
 
     # ---- retrieval ----
 
@@ -634,6 +789,76 @@ class RAGSystem:
         return None
 
 
+# --------------------------------------------------------------------------
+# Multi-department manager
+# --------------------------------------------------------------------------
+
+class RAGManager:
+    """
+    Owns one RAGSystem per department/tab (hr, marketing, finance, sales, ...).
+    Each department has its own folder of source PDFs under DATA_ROOT and
+    its own learned-QA jsonl file, so uploading a document or answering a
+    query for one department never touches another department's index.
+
+    Usage:
+        rag_manager.initialize_all()                       # once, at startup
+        context = rag_manager.search_context(dept, q)       # per request
+        rag_manager.train(dept, question, answer)           # per answered query
+    """
+
+    def __init__(self, departments: Optional[List[str]] = None) -> None:
+        self.departments = departments or list(rag_settings.DEPARTMENTS)
+        self.default_department = rag_settings.DEFAULT_DEPARTMENT
+        self._systems: Dict[str, RAGSystem] = {}
+
+        data_root = Path(rag_settings.DATA_ROOT)
+        for dept in self.departments:
+            self._systems[dept] = RAGSystem(
+                department=dept,
+                pdf_dir=str(data_root / dept),
+                learned_qa_path=str(data_root / dept / "learned_qa.jsonl"),
+                legacy_pdf_path=rag_settings.LEGACY_HR_PDF_PATH if dept == "hr" else None,
+            )
+
+    def initialize_all(self) -> None:
+        """Build every department's index. A department whose document
+        hasn't been uploaded yet fails independently (status='error') and
+        does not block the others or app startup."""
+        for dept, system in self._systems.items():
+            try:
+                system.initialize()
+            except RAGInitializationError as exc:
+                logger.error("Department '%s' not ready: %s", dept, exc)
+
+    def get(self, department: Optional[str]) -> RAGSystem:
+        dept = (department or self.default_department).strip().lower()
+        system = self._systems.get(dept)
+        if system is None:
+            raise RAGDepartmentNotFoundError(
+                f"Unknown department '{dept}'. Configured departments: {sorted(self._systems)}."
+            )
+        return system
+
+    def search_context(self, department: Optional[str], question: str) -> Optional[str]:
+        return self.get(department).search_context(question)
+
+    def train(self, department: Optional[str], question: str, answer: str) -> None:
+        """Called once a reported query is answered — adds it to that
+        department's live index immediately and persists it for reloads."""
+        self.get(department).add_qa_pair(question, answer)
+
+    def status_summary(self) -> Dict[str, str]:
+        return {dept: system.status for dept, system in self._systems.items()}
+
+    @property
+    def all_ready(self) -> bool:
+        return all(system.is_ready for system in self._systems.values())
+
+
 # Single shared instance used by the FastAPI app. Built once via
-# rag_system.initialize() in main.py's startup/lifespan handler.
-rag_system = RAGSystem()
+# rag_manager.initialize_all() in main.py's startup/lifespan handler.
+rag_manager = RAGManager()
+
+# Backward-compat alias: existing code that imports `rag_system` for the
+# default department (hr) keeps working unchanged.
+rag_system = rag_manager.get(rag_settings.DEFAULT_DEPARTMENT)

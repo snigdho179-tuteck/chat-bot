@@ -2,6 +2,16 @@
 <html lang="en">
 
 <head>
+  <script>
+    // Auth guard: bounce to login.html if there's no active session.
+    // Runs before the rest of the page renders.
+    (function () {
+      var token = localStorage.getItem('authToken');
+      if (!token) {
+        window.location.replace('login.html');
+      }
+    })();
+  </script>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>HR-Assistant</title>
@@ -312,8 +322,14 @@
       margin: 4px 0 0;
     }
 
-    .status-strip {
+    .header-actions {
       grid-area: status;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .status-strip {
       margin: 0;
       display: flex;
       align-items: center;
@@ -357,6 +373,176 @@
       50% {
         opacity: .35;
       }
+    }
+
+    /* Avatar + account menu */
+    .account {
+      position: relative;
+      flex-shrink: 0;
+    }
+
+    .avatar-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      border: 1px solid var(--line);
+      background: linear-gradient(135deg, #7559e8, #5d46d2);
+      color: #fff;
+      font-size: 13px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: var(--shadow-sm);
+      transition: transform .15s ease, box-shadow .15s ease;
+    }
+
+    .avatar-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba(93, 70, 210, .28);
+    }
+
+    .account-menu {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      min-width: 172px;
+      background: var(--surface, #fff);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      box-shadow: 0 14px 34px rgba(20, 24, 40, .14);
+      padding: 6px;
+      display: none;
+      flex-direction: column;
+      gap: 2px;
+      z-index: 40;
+    }
+
+    .account-menu.open {
+      display: flex;
+    }
+
+    .account-menu button {
+      all: unset;
+      box-sizing: border-box;
+      width: 100%;
+      padding: 9px 10px;
+      border-radius: 8px;
+      font-size: 13.5px;
+      font-weight: 600;
+      color: var(--ink, #101828);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .account-menu button:hover {
+      background: rgba(117, 89, 232, .10);
+    }
+
+    .account-menu button.danger {
+      color: #c0392b;
+    }
+
+    .account-menu button.danger:hover {
+      background: rgba(192, 57, 43, .10);
+    }
+
+    .account-menu hr {
+      border: none;
+      border-top: 1px solid var(--line);
+      margin: 4px 2px;
+    }
+
+    .profile-card-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(16, 24, 40, .34);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 60;
+    }
+
+    .profile-card-overlay.open {
+      display: flex;
+    }
+
+    .profile-card {
+      width: min(300px, 88vw);
+      background: #fff;
+      border-radius: 18px;
+      padding: 22px 22px 18px;
+      box-shadow: 0 24px 60px rgba(20, 24, 40, .28);
+      text-align: center;
+    }
+
+    .profile-card .avatar-lg {
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      margin: 0 auto 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-size: 20px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #7559e8, #5d46d2);
+    }
+
+    .profile-card .p-name {
+      font-size: 16px;
+      font-weight: 750;
+      color: var(--ink, #101828);
+      margin-bottom: 2px;
+    }
+
+    .profile-card .p-email {
+      font-size: 13px;
+      color: var(--ink-soft, #667085);
+      margin-bottom: 10px;
+      word-break: break-all;
+    }
+
+    .profile-card .p-role {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      color: #5d46d2;
+      background: rgba(117, 89, 232, .12);
+      border-radius: 999px;
+      padding: 4px 12px;
+      margin-bottom: 18px;
+    }
+
+    .profile-card .logout-btn {
+      width: 100%;
+      height: 42px;
+      border: 0;
+      border-radius: 12px;
+      cursor: pointer;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 700;
+      background: #c0392b;
+      margin-bottom: 8px;
+    }
+
+    .profile-card .close-btn {
+      width: 100%;
+      height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      cursor: pointer;
+      background: #fff;
+      color: var(--ink-soft, #667085);
+      font-size: 13.5px;
+      font-weight: 600;
     }
 
     /* Thread */
@@ -460,6 +646,46 @@
       border-color: rgba(209, 79, 79, .2);
       background: #fff2f2;
       color: var(--bad);
+    }
+
+    .row.assistant {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .report-btn {
+      margin-top: 6px;
+      margin-left: 4px;
+      font-size: 11.5px;
+      font-weight: 600;
+      letter-spacing: .01em;
+      color: var(--ink-faint);
+      background: transparent;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 11px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: color .15s ease, border-color .15s ease, background .15s ease;
+    }
+
+    .report-btn:hover:not(:disabled) {
+      color: var(--bad);
+      border-color: rgba(209, 79, 79, .35);
+      background: #fff5f5;
+    }
+
+    .report-btn:disabled {
+      color: var(--good);
+      border-color: rgba(34, 160, 107, .3);
+      background: rgba(34, 160, 107, .06);
+      cursor: default;
+    }
+
+    .report-btn i {
+      font-size: 11px;
     }
 
     .thinking {
@@ -821,10 +1047,34 @@
             <p class="title">HR-Assistant</p>
             <p class="subtitle">Ask about policies, leave, and benefits</p>
 
-            <div class="status-strip mono">
-              <span class="status-dot checking" id="statusDot"></span>
-              <span id="statusText">CHECKING MODEL SERVER…</span>
+            <div class="header-actions">
+              <div class="status-strip mono">
+                <span class="status-dot checking" id="statusDot"></span>
+                <span id="statusText">CHECKING MODEL SERVER…</span>
+              </div>
+
+              <div class="account" id="account">
+                <button class="avatar-btn" id="avatarBtn" aria-label="Account menu" aria-haspopup="true" aria-expanded="false">
+                  <span id="avatarInitial">U</span>
+                </button>
+                <div class="account-menu" id="accountMenu" role="menu">
+                  <button type="button" id="profileMenuBtn" role="menuitem">Profile</button>
+                  <button type="button" id="adminPanelMenuBtn" role="menuitem" style="display:none;">Admin Panel</button>
+                  <hr />
+                  <button type="button" class="danger" id="logoutMenuBtn" role="menuitem">Log out</button>
+                </div>
+              </div>
             </div>
+          </div>
+        </div>
+
+        <div class="profile-card-overlay" id="profileOverlay">
+          <div class="profile-card">
+            <div class="avatar-lg" id="profileAvatarInitial">U</div>
+            <div class="p-name" id="profileName">—</div>
+            <div class="p-email" id="profileEmail">—</div>
+            <div><span class="p-role" id="profileRole">—</span></div>
+            <button class="close-btn" id="profileCloseBtn">Close</button>
           </div>
         </div>
 
@@ -887,6 +1137,91 @@
     const sidebar = document.getElementById('sidebar');
     const sidebarOverlay = document.getElementById('sidebarOverlay');
     const menuToggle = document.getElementById('menuToggle');
+
+    // ---- Account: avatar dropdown, profile card, logout ----
+    (function initAccount() {
+      const avatarBtn = document.getElementById('avatarBtn');
+      const accountMenu = document.getElementById('accountMenu');
+      const avatarInitial = document.getElementById('avatarInitial');
+      const profileMenuBtn = document.getElementById('profileMenuBtn');
+      const adminPanelMenuBtn = document.getElementById('adminPanelMenuBtn');
+      const logoutMenuBtn = document.getElementById('logoutMenuBtn');
+
+      const profileOverlay = document.getElementById('profileOverlay');
+      const profileAvatarInitial = document.getElementById('profileAvatarInitial');
+      const profileName = document.getElementById('profileName');
+      const profileEmail = document.getElementById('profileEmail');
+      const profileRole = document.getElementById('profileRole');
+      const profileLogoutBtn = document.getElementById('profileLogoutBtn');
+      const profileCloseBtn = document.getElementById('profileCloseBtn');
+
+      const email = localStorage.getItem('userEmail') || '';
+      const role = localStorage.getItem('userRole') || '';
+      const displayName = email ? email.split('@')[0] : 'User';
+      const initial = displayName.charAt(0).toUpperCase() || 'U';
+
+      avatarInitial.textContent = initial;
+      profileAvatarInitial.textContent = initial;
+      profileName.textContent = displayName;
+      profileEmail.textContent = email || '—';
+      profileRole.textContent = role || '—';
+
+      // Only hr-employee and admin accounts may open the admin panel.
+      if (role === 'admin' || role === 'hr-employee') {
+        adminPanelMenuBtn.style.display = '';
+      }
+      adminPanelMenuBtn.addEventListener('click', () => {
+        window.location.href = 'admin_panel.html';
+      });
+
+      function closeMenu() {
+        accountMenu.classList.remove('open');
+        avatarBtn.setAttribute('aria-expanded', 'false');
+      }
+
+      avatarBtn.addEventListener('click', event => {
+        event.stopPropagation();
+        const isOpen = accountMenu.classList.toggle('open');
+        avatarBtn.setAttribute('aria-expanded', String(isOpen));
+      });
+
+      document.addEventListener('click', event => {
+        if (!document.getElementById('account').contains(event.target)) {
+          closeMenu();
+        }
+      });
+
+      function logout() {
+        localStorage.removeItem('authToken');
+        localStorage.removeItem('userId');
+        localStorage.removeItem('userEmail');
+        localStorage.removeItem('userRole');
+        window.location.href = 'login.html';
+      }
+
+      profileMenuBtn.addEventListener('click', () => {
+        closeMenu();
+        profileOverlay.classList.add('open');
+      });
+
+      logoutMenuBtn.addEventListener('click', () => {
+        closeMenu();
+        logout();
+      });
+
+      //profileLogoutBtn.addEventListener('click', logout);
+
+      profileCloseBtn.addEventListener('click', () => {
+        profileOverlay.classList.remove('open');
+      });
+
+      profileOverlay.addEventListener('click', event => {
+        if (event.target === profileOverlay) {
+          profileOverlay.classList.remove('open');
+        }
+      });
+    })();
+
 
     const pendingRequests = new Set();
 
@@ -1102,7 +1437,8 @@
         return;
       }
 
-      for (const msg of chat.messages) {
+      for (let i = 0; i < chat.messages.length; i++) {
+        const msg = chat.messages[i];
         const row = document.createElement('div');
         row.className = `row ${msg.role} `;
 
@@ -1111,6 +1447,26 @@
         bubble.textContent = msg.text;
 
         row.appendChild(bubble);
+
+        // Assistant answers (excluding error bubbles) can be flagged for
+        // HR/admin follow-up. The question is the nearest preceding user
+        // message in the same chat.
+        if (msg.role === 'assistant' && !msg.isError) {
+          const reportBtn = document.createElement('button');
+          reportBtn.type = 'button';
+          reportBtn.className = 'report-btn';
+
+          if (msg.reported) {
+            reportBtn.disabled = true;
+            reportBtn.innerHTML = '<i class="fa-solid fa-check"></i> Reported to admin';
+          } else {
+            reportBtn.innerHTML = '<i class="fa-regular fa-flag"></i> Report to admin';
+            reportBtn.addEventListener('click', () => reportToAdmin(chat.id, i, reportBtn));
+          }
+
+          row.appendChild(reportBtn);
+        }
+
         thread.appendChild(row);
       }
 
@@ -1146,6 +1502,55 @@
 
       // A background response must never be painted into the active chat.
       if (state.activeId === chatId) renderThread();
+    }
+
+    // ---------- Report to admin ----------
+
+    async function reportToAdmin(chatId, messageIndex, btnEl) {
+      const chat = state.chats[chatId];
+      if (!chat) return;
+
+      const assistantMsg = chat.messages[messageIndex];
+      if (!assistantMsg || assistantMsg.reported) return;
+
+      // Walk backwards from the assistant message to find the question that
+      // prompted it.
+      let question = '';
+      for (let i = messageIndex - 1; i >= 0; i--) {
+        if (chat.messages[i].role === 'user') {
+          question = chat.messages[i].text;
+          break;
+        }
+      }
+
+      btnEl.disabled = true;
+      btnEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Reporting…';
+
+      try {
+        const res = await fetch(`${API_BASE}/queries`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${localStorage.getItem('authToken') || ''}`,
+          },
+          body: JSON.stringify({
+            question,
+            answer: assistantMsg.text,
+            surveyTitle: chat.title || 'General',
+            chatId,
+          }),
+        });
+
+        if (!res.ok) throw new Error('Request failed');
+
+        assistantMsg.reported = true;
+        saveState();
+        renderThread();
+      } catch (err) {
+        btnEl.disabled = false;
+        btnEl.innerHTML = '<i class="fa-regular fa-flag"></i> Report to admin';
+        alert('Could not report this question. Please check that the assistant backend is running and try again.');
+      }
     }
 
     // ---------- New chat / sidebar toggle ----------

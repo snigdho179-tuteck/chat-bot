@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover
     GoogleTranslator = None  # type: ignore[assignment]
     _TRANSLATOR_AVAILABLE = False
 
-from rag import RAGInitializationError, RAGNotReadyError, rag_system
+from rag import RAGInitializationError, RAGNotReadyError, rag_manager, rag_system
 
 # Load variables from a .env file into os.environ, before Settings reads
 # them below. We point load_dotenv() at the directory this file lives in
@@ -179,6 +179,15 @@ class ChatRequest(BaseModel):
             "translated back into this language before being returned."
         ),
         examples=["bn-IN"],
+    )
+    department: str = Field(
+        default="hr",
+        description=(
+            "Which department tab the question was asked from (e.g. 'hr', "
+            "'marketing', 'finance', 'sales'). Selects which department's "
+            "document index + answered-query training data to search."
+        ),
+        examples=["hr"],
     )
 
 
@@ -365,6 +374,20 @@ llama_process_manager = LlamaProcessManager()
 # Frontend static file server
 # --------------------------------------------------------------------------
 
+class _LoginFirstRequestHandler(http.server.SimpleHTTPRequestHandler):
+    """
+    Same as SimpleHTTPRequestHandler, except a request for "/" is served
+    login.html instead of index.html — so visiting the app always lands
+    on the login screen first. index.html itself has its own client-side
+    guard that bounces back to login.html if there's no active session.
+    """
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib method name
+        if self.path == "/":
+            self.path = "/login.html"
+        super().do_GET()
+
+
 class FrontendServer:
     """
     Serves frontend/index.html on a local port in a background thread, so
@@ -412,10 +435,17 @@ class FrontendServer:
             return
 
         index_file = resolved_dir / "index.html"
+        login_file = resolved_dir / "login.html"
+        if not login_file.is_file():
+            logger.warning(
+                "No login.html found in %s — requests to \"/\" will 404. "
+                "Add login.html so the app opens on the login screen first.",
+                resolved_dir,
+            )
         if not index_file.is_file():
             logger.warning(
                 "No index.html found in %s — the frontend server will start, "
-                "but there may be nothing to load.",
+                "but there may be nothing to load after login.",
                 resolved_dir,
             )
 
@@ -431,7 +461,7 @@ class FrontendServer:
             return
 
         handler = functools.partial(
-            http.server.SimpleHTTPRequestHandler,
+            _LoginFirstRequestHandler,
             directory=str(resolved_dir),
         )
 
@@ -702,13 +732,13 @@ def _build_user_message(context: str, question: str) -> str:
     )
 
 
-def generate_answer(question: str, language: str = "en-IN") -> str:
+def generate_answer(question: str, language: str = "en-IN", department: str = "hr") -> str:
     """
     The full question -> answer pipeline, with translation at both ends:
 
         question (any language)
           -> translate to English
-          -> smalltalk check -> RAG search -> retrieved context -> Qwen -> answer (English)
+          -> smalltalk check -> RAG search (for `department`) -> retrieved context -> Qwen -> answer (English)
           -> translate back to the original language
 
     Greetings/small talk get a friendly canned reply directly (translated
@@ -726,7 +756,7 @@ def generate_answer(question: str, language: str = "en-IN") -> str:
     if english_question != question:
         logger.info("Translated incoming message %s -> en for processing.", lang_code)
 
-    answer_en = _generate_answer_en(english_question)
+    answer_en = _generate_answer_en(english_question, department=department)
 
     if lang_code == "en":
         return answer_en
@@ -737,17 +767,17 @@ def generate_answer(question: str, language: str = "en-IN") -> str:
     return translated_answer
 
 
-def _generate_answer_en(question: str) -> str:
+def _generate_answer_en(question: str, department: str = "hr") -> str:
     """The original English-only pipeline: smalltalk -> RAG -> Qwen -> answer."""
     smalltalk_reply = _detect_smalltalk(question)
     if smalltalk_reply is not None:
         logger.info("Detected small talk — replying directly without RAG/Qwen.")
         return smalltalk_reply
 
-    context = rag_system.search_context(question)
+    context = rag_manager.search_context(department, question)
 
     if context is None:
-        logger.info("No relevant handbook context found — returning refusal message.")
+        logger.info("No relevant context found for department '%s' — returning refusal message.", department)
         return settings.REFUSAL_MESSAGE
 
     user_message = _build_user_message(context, question)

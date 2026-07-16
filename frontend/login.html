@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -62,6 +63,12 @@
       gap: 12px;
     }
 
+    .brand-logo {
+      width: 36px;
+      height: 36px;
+      object-fit: contain;
+    }
+
     .logo {
       width: 40px;
       height: 40px;
@@ -69,8 +76,6 @@
       display: grid;
       place-items: center;
       color: white;
-      background: linear-gradient(135deg, var(--primary), var(--primary-dark));
-      box-shadow: 0 12px 24px rgba(117, 89, 232, 0.30);
     }
 
     .brand-text h1 {
@@ -110,7 +115,7 @@
 
     .login-card {
       width: min(460px, 100%);
-      padding: 28px 30px;
+      padding: 29px 10px;
       border-radius: var(--radius-lg);
       background: var(--panel);
       border: 1px solid rgba(255, 255, 255, 0.92);
@@ -119,15 +124,13 @@
     }
 
     .login-icon {
-      width: 52px;
-      height: 52px;
+      width: 60px;
+      height: 60px;
       display: grid;
       place-items: center;
-      margin: 0 auto 14px;
+      margin: 0 auto 5px;
       color: #fff;
       border-radius: 16px;
-      background: linear-gradient(135deg, var(--primary), var(--primary-dark));
-      box-shadow: 0 15px 34px rgba(117, 89, 232, 0.32);
     }
 
     .login-card h2 {
@@ -294,35 +297,93 @@
     }
 
     @media (max-height: 760px) {
-      .page { padding-top: 18px; }
-      .topbar { padding-bottom: 14px; }
-      .login-center { padding: 14px 0 8px; }
-      .login-card { padding: 22px 28px; width: min(440px, 100%); }
-      .login-icon { width: 46px; height: 46px; margin-bottom: 10px; }
-      .login-card h2 { font-size: 22px; }
-      .login-card .subtitle { margin-bottom: 14px; }
-      .role-tabs { margin-bottom: 14px; }
-      input { height: 46px; }
-      .login-btn { height: 48px; }
-      .helper { display: none; }
+      .page {
+        padding-top: 18px;
+      }
+
+      .topbar {
+        padding-bottom: 14px;
+      }
+
+      .login-center {
+        padding: 14px 0 8px;
+      }
+
+      .login-card {
+        padding: 22px 18px;
+        width: min(440px, 100%);
+      }
+
+      /* .login-icon {
+        width: 56px;
+        height: 56px;
+        margin-bottom: 8px;
+      } */
+
+      .login-card h2 {
+        font-size: 22px;
+      }
+
+      .login-card .subtitle {
+        margin-bottom: 14px;
+      }
+
+      .role-tabs {
+        margin-bottom: 14px;
+      }
+
+      input {
+        height: 46px;
+      }
+
+      .login-btn {
+        height: 48px;
+      }
+
+      .helper {
+        display: none;
+      }
     }
 
     @media (max-width: 720px) {
-      body { overflow: auto; }
-      .page { padding: 20px 16px 14px; }
-      .topbar { flex-direction: column; align-items: flex-start; gap: 14px; }
-      .status-pill { width: 100%; text-align: center; }
-      .login-card { padding: 24px 20px; }
-      .form-row { align-items: flex-start; flex-direction: column; gap: 10px; }
+      body {
+        overflow: auto;
+      }
+
+      .page {
+        padding: 20px 16px 14px;
+      }
+
+      .topbar {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 14px;
+      }
+
+      .status-pill {
+        width: 100%;
+        text-align: center;
+      }
+
+      .login-card {
+        padding: 24px 20px;
+      }
+
+      .form-row {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 10px;
+      }
     }
   </style>
 </head>
+
 <body>
   <main class="page">
     <header class="topbar">
       <div class="brand">
         <div class="logo" aria-hidden="true">
-          <svg width="21" height="21" viewBox="0 0 24 24" fill="none"><path d="M12 3l1.55 5.25L19 10l-5.45 1.75L12 17l-1.55-5.25L5 10l5.45-1.75L12 3z" fill="currentColor"/></svg>
+          <img src="./assets/mp-birla-logo.png" alt="brand-logo" class="brand-logo">
         </div>
         <div class="brand-text">
           <h1>HR-Assistant</h1>
@@ -335,44 +396,72 @@
     <section class="login-center">
       <form class="login-card" id="loginForm">
         <div class="login-icon" aria-hidden="true">
-          <svg width="25" height="25" viewBox="0 0 24 24" fill="none"><path d="M12 3l1.55 5.25L19 10l-5.45 1.75L12 17l-1.55-5.25L5 10l5.45-1.75L12 3z" fill="currentColor"/></svg>
+          <img src="./assets/mp-birla-logo.png" alt="brand-logo" class="brand-logo">
         </div>
 
-        <h2>Welcome back</h2>
-        <p class="subtitle">Choose a role and sign in to continue.</p>
+        <h2 id="formTitle">Welcome back</h2>
+        <p class="subtitle" id="formSubtitle">Sign in with your email and password to continue.</p>
 
-        <div class="role-tabs" aria-label="Select login role">
-          <button class="role-tab active" type="button" data-role="Employee">Employee</button>
-          <button class="role-tab" type="button" data-role="Admin">Admin</button>
+        <div class="role-tabs" aria-label="Choose sign in or sign up">
+          <button class="role-tab active" type="button" data-mode="signin">Sign In</button>
+          <button class="role-tab" type="button" data-mode="signup">Sign Up</button>
         </div>
 
-        <input type="hidden" id="selectedRole" name="role" value="Employee" />
+        <div class="form-group" id="roleGroup" style="display: none;">
+          <label for="role">Role</label>
+          <div class="input-wrap">
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="M12 12c2.5 0 4.5-2 4.5-4.5S14.5 3 12 3 7.5 5 7.5 7.5 9.5 12 12 12z" stroke="currentColor"
+                stroke-width="1.8" />
+              <path d="M4 21c0-4 3.6-7 8-7s8 3 8 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+            </svg>
+            <select id="role" name="role"
+              style="padding-left: 44px; width: 100%; height: 50px; border: 1px solid #d9e0ef; border-radius: 15px; background: rgba(255,255,255,0.88); font-size: 15px; color: var(--text); outline: none;">
+              <option value="user">User</option>
+              <option value="hr-employee">HR-Employee</option>
+              <option value="admin">Admin</option>
+            </select>
+          </div>
+        </div>
 
         <div class="form-group">
           <label for="email">Email address</label>
           <div class="input-wrap">
-            <svg viewBox="0 0 24 24" fill="none"><path d="M4 6.5h16v11H4v-11z" stroke="currentColor" stroke-width="1.8"/><path d="M4.5 7l7.5 6 7.5-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            <input id="email" name="email" type="email" autocomplete="email" placeholder="Enter email address" required />
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="M4 6.5h16v11H4v-11z" stroke="currentColor" stroke-width="1.8" />
+              <path d="M4.5 7l7.5 6 7.5-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                stroke-linejoin="round" />
+            </svg>
+            <input id="email" name="email" type="email" autocomplete="email" placeholder="Enter email address"
+              required />
           </div>
         </div>
 
         <div class="form-group">
           <label for="password">Password</label>
           <div class="input-wrap">
-            <svg viewBox="0 0 24 24" fill="none"><path d="M7 10V8a5 5 0 0110 0v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M6 10h12v9H6v-9z" stroke="currentColor" stroke-width="1.8"/><path d="M12 14v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-            <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Enter password" required />
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="M7 10V8a5 5 0 0110 0v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+              <path d="M6 10h12v9H6v-9z" stroke="currentColor" stroke-width="1.8" />
+              <path d="M12 14v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+            </svg>
+            <input id="password" name="password" type="password" autocomplete="current-password"
+              placeholder="Enter password" required />
           </div>
         </div>
 
-        <div class="form-row">
+        <div class="form-row" id="rememberRow">
           <label class="remember"><input name="rememberDevice" type="checkbox" /> Remember this device</label>
           <a class="forgot" href="#">Forgot password?</a>
         </div>
 
-        <button class="login-btn" type="submit">Sign in as Employee</button>
+        <div class="form-group" id="formError"
+          style="display:none; color:#c0392b; font-size:13px; text-align:center; margin-bottom:10px;"></div>
+
+        <button class="login-btn" type="submit" id="submitBtn">Sign In</button>
 
         <div class="helper">
-          Endpoints are intentionally blank. Add your backend URL in the script section.
+          Backed by /auth/login and /auth/signup on this server.
         </div>
       </form>
     </section>
@@ -381,24 +470,51 @@
   </main>
 
   <script>
-    const LOGIN_ENDPOINT = "";
+    // The API (FastAPI/uvicorn) runs on a different port than the static
+    // frontend server, so this must point at it explicitly rather than
+    // being same-origin ("").  Update the host/port if yours differ.
+    const API_BASE = "http://localhost:5002";
+    const LOGIN_ENDPOINT = `${API_BASE}/auth/login`;
+    const SIGNUP_ENDPOINT = `${API_BASE}/auth/signup`;
     const FORGOT_PASSWORD_ENDPOINT = "";
-    const REDIRECT_AFTER_LOGIN = "";
+    // Plain "user" accounts land on the chatbot; "hr-employee" and "admin"
+    // go straight to the admin panel (they can jump back to the chatbot
+    // from there with the "Chat" button).
+    function redirectForRole(role) {
+      return role === "user" ? "index.html" : "admin_panel.html";
+    }
 
     const tabs = document.querySelectorAll('.role-tab');
-    const selectedRole = document.getElementById('selectedRole');
-    const loginBtn = document.querySelector('.login-btn');
     const form = document.getElementById('loginForm');
     const forgotLink = document.querySelector('.forgot');
+    const rememberRow = document.getElementById('rememberRow');
+    const roleGroup = document.getElementById('roleGroup');
+    const formTitle = document.getElementById('formTitle');
+    const formSubtitle = document.getElementById('formSubtitle');
+    const submitBtn = document.getElementById('submitBtn');
+    const formError = document.getElementById('formError');
+
+    let mode = 'signin'; // 'signin' | 'signup'
+
+    function applyMode() {
+      const isSignup = mode === 'signup';
+      roleGroup.style.display = isSignup ? '' : 'none';
+      rememberRow.style.display = isSignup ? 'none' : 'flex';
+      document.getElementById('role').required = isSignup;
+      formTitle.textContent = isSignup ? 'Create an account' : 'Welcome back';
+      formSubtitle.textContent = isSignup
+        ? 'Sign up with your email, password, and role.'
+        : 'Sign in with your email and password to continue.';
+      submitBtn.textContent = isSignup ? 'Sign Up' : 'Sign In';
+      formError.style.display = 'none';
+    }
 
     tabs.forEach(tab => {
       tab.addEventListener('click', () => {
         tabs.forEach(item => item.classList.remove('active'));
         tab.classList.add('active');
-
-        const role = tab.dataset.role;
-        selectedRole.value = role;
-        loginBtn.textContent = `Sign in as ${role}`;
+        mode = tab.dataset.mode;
+        applyMode();
       });
     });
 
@@ -413,19 +529,30 @@
       window.location.href = FORGOT_PASSWORD_ENDPOINT;
     });
 
+    function showError(message) {
+      formError.textContent = message;
+      formError.style.display = 'block';
+    }
+
     form.addEventListener('submit', async event => {
       event.preventDefault();
+      formError.style.display = 'none';
 
-      if (!LOGIN_ENDPOINT) {
-        console.warn('LOGIN_ENDPOINT is blank. Add your authentication endpoint before enabling login.');
-        return;
-      }
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
 
-      const formData = new FormData(form);
-      const payload = Object.fromEntries(formData.entries());
+      const isSignup = mode === 'signup';
+      const endpoint = isSignup ? SIGNUP_ENDPOINT : LOGIN_ENDPOINT;
+      const payload = isSignup
+        ? { email, password, role: document.getElementById('role').value }
+        : { email, password };
+
+      submitBtn.disabled = true;
+      const originalLabel = submitBtn.textContent;
+      submitBtn.textContent = isSignup ? 'Signing up…' : 'Signing in…';
 
       try {
-        const response = await fetch(LOGIN_ENDPOINT, {
+        const response = await fetch(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'
@@ -433,21 +560,32 @@
           body: JSON.stringify(payload)
         });
 
-        if (!response.ok) {
-          throw new Error('Login request failed');
-        }
-
         const result = await response.json();
 
-        if (REDIRECT_AFTER_LOGIN) {
-          window.location.href = REDIRECT_AFTER_LOGIN;
+        if (!response.ok) {
+          throw new Error(result.detail || 'Request failed. Please try again.');
         }
 
-        console.log(result);
+        // Store the JWT so subsequent API calls can send:
+        // Authorization: Bearer <token>
+        localStorage.setItem('authToken', result.token);
+        localStorage.setItem('userId', result.user_id);
+        localStorage.setItem('userEmail', result.email);
+        localStorage.setItem('userRole', result.role);
+        localStorage.setItem('userTabs', JSON.stringify(result.tabs || []));
+
+        window.location.href = redirectForRole(result.role);
       } catch (error) {
         console.error(error);
+        showError(error.message || 'Something went wrong. Please try again.');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = originalLabel;
       }
     });
+
+    applyMode();
   </script>
 </body>
+
 </html>
