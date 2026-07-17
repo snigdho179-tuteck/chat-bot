@@ -593,6 +593,55 @@ class RAGSystem:
             logger.exception("Unexpected error during RAG initialization for department '%s'", self.department)
             raise RAGInitializationError(f"Unexpected error building the vector index: {exc}") from exc
 
+    def reload(self) -> None:
+        """
+        Force a full rebuild from whatever PDFs currently sit in pdf_dir —
+        unlike initialize(), this does NOT no-op if already loaded. Called
+        right after the admin uploads or deletes a department document so
+        the change is live immediately, no restart required.
+        """
+        self._embedding_model = None
+        self._index = None
+        self._chunks = []
+        self._qa_chunk_count = 0
+        self._status = "not_loaded"
+        self._last_error = None
+        try:
+            self.initialize()
+        except RAGInitializationError:
+            # No PDFs left (e.g. the last one was just deleted) — leave the
+            # department registered but empty/"error" rather than crashing
+            # the request; initialize() already recorded the reason.
+            pass
+
+    def list_documents(self) -> List[Dict[str, object]]:
+        """Every PDF currently on disk for this department — used by the
+        admin's File Management table."""
+        dir_path = Path(self.pdf_dir)
+        if not dir_path.is_dir():
+            return []
+        docs = []
+        for p in sorted(dir_path.glob("*.pdf")):
+            stat = p.stat()
+            docs.append({
+                "filename": p.name,
+                "size_bytes": stat.st_size,
+                "uploaded_at": stat.st_mtime,
+            })
+        return docs
+
+    def delete_document(self, filename: str) -> bool:
+        """Remove one uploaded PDF and re-index from what's left. Returns
+        False if the file didn't exist."""
+        target = Path(self.pdf_dir) / filename
+        # Guard against path traversal — filename must resolve to a direct
+        # child of this department's own folder.
+        if target.parent.resolve() != Path(self.pdf_dir).resolve() or not target.is_file():
+            return False
+        target.unlink()
+        self.reload()
+        return True
+
     def _discover_pdfs(self) -> List[str]:
         """PDFs for this department: every *.pdf in pdf_dir, sorted for a
         stable chunk order; falls back to the single legacy file (hr only)
@@ -839,6 +888,48 @@ class RAGManager:
             )
         return system
 
+    def ensure_department(self, department: str) -> RAGSystem:
+        """
+        Get a department's RAGSystem, creating (registering) it on the fly
+        if this is a brand-new slug. This is what makes "upload a PDF for
+        a department that doesn't exist yet" create the department/tab —
+        no restart or .env edit required.
+        """
+        dept = (department or "").strip().lower()
+        if not dept:
+            raise RAGDepartmentNotFoundError("Department name cannot be empty.")
+        if dept not in self._systems:
+            data_root = Path(rag_settings.DATA_ROOT)
+            self._systems[dept] = RAGSystem(
+                department=dept,
+                pdf_dir=str(data_root / dept),
+                learned_qa_path=str(data_root / dept / "learned_qa.jsonl"),
+            )
+            self.departments.append(dept)
+            logger.info("Registered new department '%s'.", dept)
+        return self._systems[dept]
+
+    def reload(self, department: str) -> RAGSystem:
+        """Force a department to fully re-index from disk right now (after
+        an upload or delete), rather than waiting for the next restart."""
+        system = self.get(department)
+        system.reload()
+        return system
+
+    def list_documents(self, department: str) -> List[Dict[str, object]]:
+        return self.get(department).list_documents()
+
+    def delete_document(self, department: str, filename: str) -> bool:
+        return self.get(department).delete_document(filename)
+
+    def remove_department(self, department: str) -> None:
+        """Drop a department entirely (all its documents were removed).
+        The chat UI simply stops showing a tab for it once it has zero
+        ready documents; this only matters for the admin's own bookkeeping."""
+        dept = (department or "").strip().lower()
+        self._systems.pop(dept, None)
+        self.departments = [d for d in self.departments if d != dept]
+
     def search_context(self, department: Optional[str], question: str) -> Optional[str]:
         return self.get(department).search_context(question)
 
@@ -849,6 +940,20 @@ class RAGManager:
 
     def status_summary(self) -> Dict[str, str]:
         return {dept: system.status for dept, system in self._systems.items()}
+
+    def list_departments_detail(self) -> List[Dict[str, object]]:
+        """Slug + status + document/chunk counts for every registered
+        department — the raw material for GET /departments."""
+        details = []
+        for dept, system in self._systems.items():
+            details.append({
+                "slug": dept,
+                "status": system.status,
+                "document_count": len(system.list_documents()),
+                "chunk_count": system.chunk_count,
+                "last_error": system.last_error,
+            })
+        return sorted(details, key=lambda d: d["slug"])
 
     @property
     def all_ready(self) -> bool:

@@ -7,7 +7,7 @@ Run directly:
     python main.py
 
 Or via uvicorn (equivalent, supports --reload):
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    uvicorn main:app --host 0.0.0.0 --port 5002 --reload
 
 Endpoints:
     POST /chat    -> question -> RAG search -> retrieved context -> Qwen -> answer.
@@ -23,6 +23,24 @@ Endpoints:
         POST   /auth/users       -> create a user with a role/status/tabs  (admin only)
         PUT    /auth/users/{id}  -> update a user's role/status/tabs       (admin only)
         DELETE /auth/users/{id}  -> delete a user                          (admin only)
+
+    Unanswered queries (see queries.py):
+        POST   /queries          -> report a chatbot answer for human follow-up (any logged-in user)
+        GET    /queries          -> list reported queries                       (needs "queries" tab)
+        PATCH  /queries/{id}     -> submit/update an answer; trains that
+                                     department's RAG index the moment it's
+                                     first marked "answered"                     (needs "queries" tab)
+        DELETE /queries/{id}     -> delete a reported query                     (needs "queries" tab)
+
+    Departments / File Management (see departments.py):
+        GET    /departments                        -> list departments + status (any logged-in user)
+        GET    /departments/{slug}/documents        -> list a department's PDFs        (admin only)
+        POST   /departments/upload                  -> upload a PDF; creates the
+                                                         department (and its chatbot
+                                                         tab) if it's new, and
+                                                         (re)indexes it immediately     (admin only)
+        DELETE /departments/{slug}/documents/{name} -> remove one PDF, re-index        (admin only)
+        DELETE /departments/{slug}                  -> remove a department entirely    (admin only)
 """
 
 from __future__ import annotations
@@ -51,6 +69,7 @@ from backend import (
 from rag import RAGInitializationError, RAGNotReadyError, rag_manager
 from auth import init_db, router as auth_router
 from queries import init_db as init_queries_db, router as queries_router
+from departments import router as departments_router
 
 # --------------------------------------------------------------------------
 # App setup
@@ -137,6 +156,11 @@ app.include_router(auth_router)
 
 # Unanswered-queries routes: POST/GET/PATCH/DELETE /queries
 app.include_router(queries_router)
+
+# Department file-management routes: GET/POST/DELETE /departments
+# (admin-only PDF upload -> creates the department's chatbot tab and
+# (re)builds its RAG index immediately)
+app.include_router(departments_router)
 
 
 # --------------------------------------------------------------------------

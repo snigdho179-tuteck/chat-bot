@@ -673,26 +673,68 @@ def translate_text(text: str, source_lang: str, target_lang: str) -> str:
 # not a substring, so this never intercepts real questions that happen to
 # start with a greeting-like word (e.g. "hey, what's the leave policy?"
 # still falls through to RAG below).
+# Department-specific display name + topic blurb used to build the smalltalk
+# replies below. Any department slug NOT listed here (e.g. a brand-new one
+# an admin just uploaded a document for) still works — it falls back to a
+# title-cased version of the slug and a generic "policies and procedures"
+# blurb, so this never needs to be touched when a department is added.
+_DEPARTMENT_LABELS: Dict[str, str] = {
+    "hr": "HR",
+    "finance": "Finance",
+    "marketing": "Marketing",
+    "sales": "Sales",
+    "it": "IT",
+    "legal": "Legal",
+}
+
+_DEPARTMENT_TOPICS: Dict[str, str] = {
+    "hr": "company policies, leave, and benefits",
+    "finance": "expense policies, invoices, and budgets",
+    "marketing": "marketing guidelines and brand policies",
+    "sales": "sales processes and policies",
+    "it": "IT policies and systems",
+    "legal": "legal and compliance policies",
+}
+
+
+def _department_label(department: str) -> str:
+    slug = (department or "hr").strip().lower()
+    return _DEPARTMENT_LABELS.get(slug, slug.replace("_", " ").replace("-", " ").title() or "HR")
+
+
+def _department_topics(department: str) -> str:
+    slug = (department or "hr").strip().lower()
+    return _DEPARTMENT_TOPICS.get(slug, "policies and procedures")
+
+
+# Each value is a function of the department slug, so the same greeting
+# ("hi", "thanks", etc.) gets a reply scoped to whichever tab the question
+# came from, instead of always talking about HR/the employee handbook.
 _SMALLTALK_REPLIES = {
     r"hi|hii+|hello+|hey+|yo|hola": (
-        "Hello! I'm the Employee Handbook Assistant. "
-        "Ask me anything about company policies, leave, benefits, or other HR topics."
+        lambda d: (
+            f"Hello! I'm the {_department_label(d)} Assistant. "
+            f"Ask me anything about {_department_topics(d)}."
+        )
     ),
-    r"good\s?morning": "Good morning! How can I help with your HR questions today?",
-    r"good\s?afternoon": "Good afternoon! How can I help with your HR questions today?",
-    r"good\s?evening": "Good evening! How can I help with your HR questions today?",
+    r"good\s?morning": lambda d: f"Good morning! How can I help with your {_department_label(d)} questions today?",
+    r"good\s?afternoon": lambda d: f"Good afternoon! How can I help with your {_department_label(d)} questions today?",
+    r"good\s?evening": lambda d: f"Good evening! How can I help with your {_department_label(d)} questions today?",
     r"how are you|how('| i)?s it going|what'?s up": (
-        "I'm doing well, thanks for asking! I'm here to help with questions "
-        "about the employee handbook — leave, benefits, policies, and more."
+        lambda d: (
+            "I'm doing well, thanks for asking! I'm here to help with questions "
+            f"about {_department_topics(d)}."
+        )
     ),
     r"who are you|what are you|what can you do|help": (
-        "I'm the Employee Handbook Assistant. I can answer questions about "
-        "company policies, leave, benefits, working hours, and anything else "
-        "covered in the employee handbook."
+        lambda d: (
+            f"I'm the {_department_label(d)} Assistant. I can answer questions about "
+            f"{_department_topics(d)}, and anything else covered in the {_department_label(d)} documents."
+        )
     ),
-    r"thanks?|thank\s?you|thx|ty": "You're welcome! Let me know if you have any other HR questions.",
-    r"bye|goodbye|see\s?you|see\s?ya": "Goodbye! Feel free to come back anytime you have HR questions.",
-    r"ok|okay|cool|great|nice|got\s?it": "Great! Let me know if you have any questions about the handbook.",
+    r"thanks?|thank\s?you|thx|ty": lambda d: f"You're welcome! Let me know if you have any other {_department_label(d)} questions.",
+    r"bye|goodbye|see\s?you|see\s?ya": lambda d: f"Goodbye! Feel free to come back anytime you have {_department_label(d)} questions.",
+    r"ok|okay|cool|great|nice|got\s?it": lambda d: f"Great! Let me know if you have any questions about {_department_topics(d)}.",
 }
 
 _SMALLTALK_PATTERN = re.compile(
@@ -701,11 +743,16 @@ _SMALLTALK_PATTERN = re.compile(
 )
 
 
-def _detect_smalltalk(question: str) -> Optional[str]:
+def _detect_smalltalk(question: str, department: str = "hr") -> Optional[str]:
     """
     Return a canned reply if the whole message is a greeting/small-talk
     phrase, else None. Only matches the ENTIRE (normalized) message, so
     real handbook questions are never accidentally intercepted.
+
+    The reply text is generated for `department`, so the same "hi" gets a
+    Finance-flavored reply in the Finance tab and an HR-flavored reply in
+    the Hr tab instead of always describing itself as the "Employee
+    Handbook Assistant".
     """
     normalized = re.sub(r"\s+", " ", question.strip().lower())
     if not normalized:
@@ -716,9 +763,9 @@ def _detect_smalltalk(question: str) -> Optional[str]:
         return None
 
     matched_group = match.group(1)
-    for pattern, reply in _SMALLTALK_REPLIES.items():
+    for pattern, reply_fn in _SMALLTALK_REPLIES.items():
         if re.fullmatch(pattern, matched_group, re.IGNORECASE):
-            return reply
+            return reply_fn(department)
 
     return None
 
@@ -769,7 +816,7 @@ def generate_answer(question: str, language: str = "en-IN", department: str = "h
 
 def _generate_answer_en(question: str, department: str = "hr") -> str:
     """The original English-only pipeline: smalltalk -> RAG -> Qwen -> answer."""
-    smalltalk_reply = _detect_smalltalk(question)
+    smalltalk_reply = _detect_smalltalk(question, department=department)
     if smalltalk_reply is not None:
         logger.info("Detected small talk — replying directly without RAG/Qwen.")
         return smalltalk_reply
