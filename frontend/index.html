@@ -1667,6 +1667,7 @@
           body: JSON.stringify({
             question,
             answer: assistantMsg.text,
+            department: chat.department || activeDepartment,
             surveyTitle: chat.title || 'General',
             chatId,
           }),

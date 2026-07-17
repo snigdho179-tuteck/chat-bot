@@ -190,15 +190,17 @@
     .query-item.active { background: var(--accent-soft); }
     .query-item .q-avatar { color: var(--ink-faint); flex-shrink: 0; margin-top: 2px; }
     .query-item .q-body { min-width: 0; flex: 1; }
-    .query-item .q-title { font-weight: 700; font-size: 13.5px; margin-bottom: 2px; }
+    .query-item .q-title { font-weight: 700; font-size: 13.5px; margin-bottom: 2px; display: flex; align-items: center; gap: 6px; }
     .query-item .q-text { font-size: 13px; color: var(--ink-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .query-item .q-meta { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--ink-faint); margin-top: 5px; }
+    .q-dept-badge { display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--accent, #7c5ce7); background: var(--accent-soft, rgba(124,92,231,.1)); border-radius: 999px; padding: 2px 8px; }
 
     .respond-panel { min-height: 300px; display: flex; flex-direction: column; }
     .respond-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--ink-faint); gap: 10px; padding: 50px 20px; text-align: center; }
     .respond-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
     .respond-question { background: #fbfbff; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; font-size: 13.5px; }
-    .respond-question .rq-label { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 5px; }
+    .respond-question .rq-label { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 5px; display: flex; align-items: center; gap: 6px; }
+    .respond-hint { font-size: 12px; color: var(--ink-faint); }
     .respond-foot { padding: 14px 18px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 10px; }
     .respond-status { font-size: 12.5px; color: var(--ink-faint); align-self: center; margin-right: auto; }
   </style>
@@ -651,7 +653,7 @@ async function renderQueriesTab(main) {
     </div>
   `;
   try {
-    await fetchQueries();
+    await Promise.all([fetchQueries(), fetchDepartments().catch(() => {})]);
   } catch (err) {
     document.getElementById('queriesGrid').innerHTML =
       `<div class="empty-state">${ICONS.inbox}<div>Could not reach the API at ${API_BASE}. Make sure the backend is running.</div></div>`;
@@ -662,6 +664,13 @@ async function renderQueriesTab(main) {
     selectedQueryId = null;
   }
   paintQueriesGrid();
+}
+
+function deptLabel(slug) {
+  if (!slug) return 'HR';
+  const known = departmentsCache.find(d => d.slug === slug);
+  if (known && known.label) return known.label;
+  return slug.replace(/[_-]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
 function paintQueriesGrid() {
@@ -678,7 +687,7 @@ function paintQueriesGrid() {
           <div class="query-item ${q.id === selectedQueryId ? 'active' : ''}" onclick="selectQuery('${q.id}')">
             <span class="q-avatar">${ICONS.user || ''}</span>
             <div class="q-body">
-              <div class="q-title">${escapeHtml(q.surveyTitle || 'General')}</div>
+              <div class="q-title">${escapeHtml(q.surveyTitle || 'General')}<span class="q-dept-badge">${escapeHtml(deptLabel(q.department))}</span></div>
               <div class="q-text">${escapeHtml(q.question)}</div>
               <div class="q-meta">🕐 ${formatQueryDate(q.date)}</div>
             </div>
@@ -712,13 +721,14 @@ function paintRespondPanel() {
     <div class="panel-head">Respond to Query</div>
     <div class="respond-body">
       <div class="respond-question">
-        <div class="rq-label">${escapeHtml(q.surveyTitle || 'General')}</div>
+        <div class="rq-label">${escapeHtml(q.surveyTitle || 'General')}<span class="q-dept-badge">${escapeHtml(deptLabel(q.department))}</span></div>
         ${escapeHtml(q.question)}
       </div>
       <div class="field">
         <label>Your answer</label>
         <textarea id="f_liveAnswer" rows="7" placeholder="Type the answer for this question…">${escapeHtml(q.answer || '')}</textarea>
       </div>
+      <div class="respond-hint">This answer will train the <strong>${escapeHtml(deptLabel(q.department))}</strong> chatbot.</div>
     </div>
     <div class="respond-foot">
       <span class="respond-status" id="respondStatus"></span>
