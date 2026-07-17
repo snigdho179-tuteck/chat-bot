@@ -545,6 +545,42 @@
       font-weight: 600;
     }
 
+    /* Department tabs */
+    .dept-tabs {
+      display: flex;
+      gap: 6px;
+      padding: 12px 2px 0;
+      overflow-x: auto;
+      scrollbar-width: none;
+      flex-shrink: 0;
+    }
+    .dept-tabs::-webkit-scrollbar { display: none; }
+    .dept-tab {
+      flex-shrink: 0;
+      padding: 8px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink-soft);
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: .15s ease;
+      white-space: nowrap;
+    }
+    .dept-tab:hover { background: rgba(255,255,255,.9); }
+    .dept-tab.active {
+      color: #fff;
+      background: linear-gradient(135deg, var(--accent-2), var(--accent));
+      border-color: transparent;
+      box-shadow: 0 6px 16px rgba(91, 91, 214, .22);
+    }
+    .dept-tabs-empty {
+      padding: 10px 2px 0;
+      font-size: 12px;
+      color: var(--ink-faint);
+    }
+
     /* Thread */
     .thread {
       flex: 1;
@@ -1078,6 +1114,8 @@
           </div>
         </div>
 
+        <div class="dept-tabs" id="deptTabs"></div>
+
         <div class="thread" id="thread"></div>
 
         <div class="composer">
@@ -1123,10 +1161,74 @@
     const STORAGE_KEY = 'company_assistant_chats_v1';
     let lastInputWasVoice = false;
     const thread = document.getElementById('thread');
+    const deptTabs = document.getElementById('deptTabs');
     const input = document.getElementById('input');
     const sendBtn = document.getElementById('sendBtn');
     const micBtn = document.getElementById('micBtn');
     const ttsBtn = document.getElementById('ttsBtn');
+
+    // ---------- Department tabs ----------
+    // Populated from GET /departments (only departments an admin has
+    // actually uploaded a trained document for show up as a tab). The
+    // active department is sent as `department` on every /chat call, so
+    // the answer comes strictly from that department's document(s).
+    let departments = [];
+    let activeDepartment = null;
+
+    function authHeadersJSON() {
+      return { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('authToken') || ''}` };
+    }
+
+    async function loadDepartments() {
+      try {
+        const res = await fetch(`${API_BASE}/departments`, { headers: authHeadersJSON() });
+        if (!res.ok) throw new Error('failed');
+        const all = await res.json();
+        departments = all.filter(d => d.status === 'loaded');
+      } catch (err) {
+        departments = [];
+      }
+      if (!activeDepartment || !departments.some(d => d.slug === activeDepartment)) {
+        activeDepartment = departments[0] ? departments[0].slug : null;
+      }
+      renderDeptTabs();
+
+      // `state` may not exist yet the very first time this resolves (it's
+      // created synchronously later in the script, but this fetch always
+      // finishes after that point in practice). Guard just in case.
+      if (typeof state !== 'undefined') {
+        ensureActiveChatForDepartment();
+        renderSidebar();
+        renderThread();
+        updateSendButton();
+      }
+    }
+
+    function renderDeptTabs() {
+      if (!departments.length) {
+        deptTabs.innerHTML = '';
+        return;
+      }
+      deptTabs.innerHTML = departments.map(d => `
+        <button type="button" class="dept-tab ${d.slug === activeDepartment ? 'active' : ''}" data-slug="${d.slug}">${d.label}</button>
+      `).join('');
+      deptTabs.querySelectorAll('.dept-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (btn.dataset.slug === activeDepartment) return;
+          activeDepartment = btn.dataset.slug;
+          renderDeptTabs();
+          // Switching departments must switch the visible conversation too,
+          // otherwise a chat started in one tab bleeds into the other.
+          ensureActiveChatForDepartment();
+          renderSidebar();
+          renderThread();
+          updateSendButton();
+          closeSidebarOnMobile();
+        });
+      });
+    }
+
+    loadDepartments();
 
     let ttsEnabled = false;
     const languageSelect = document.getElementById("languageSelect");
@@ -1306,10 +1408,11 @@
       return 'c_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
     }
 
-    function createChat() {
+    function createChat(department) {
       const id = makeId();
       state.chats[id] = {
         id,
+        department: department !== undefined ? department : activeDepartment,
         title: 'New chat',
         messages: [],
         updatedAt: Date.now(),
@@ -1321,6 +1424,32 @@
 
     function getActiveChat() {
       return state.activeId ? state.chats[state.activeId] : null;
+    }
+
+    // ---------- Department scoping ----------
+    // A chat belongs to exactly one department (whichever tab it was
+    // started in). These keep the sidebar list and the active chat scoped
+    // to the currently selected tab so Finance and Hr never see each
+    // other's messages.
+
+    function chatsForActiveDepartment() {
+      return state.order.filter((id) => {
+        const chat = state.chats[id];
+        return chat && chat.department === activeDepartment;
+      });
+    }
+
+    function ensureActiveChatForDepartment() {
+      const ids = chatsForActiveDepartment();
+      if (ids.length) {
+        const active = state.chats[state.activeId];
+        if (!active || active.department !== activeDepartment) {
+          state.activeId = ids[0];
+          saveState();
+        }
+      } else {
+        createChat(activeDepartment);
+      }
     }
 
     function touchChat(chat) {
@@ -1341,10 +1470,8 @@
       renderThread();
     }
 
-    // Ensure there is always at least one chat to show
-    if (state.order.length === 0 || !state.activeId || !state.chats[state.activeId]) {
-      createChat();
-    }
+    // Ensure there is always at least one chat to show for the current tab
+    ensureActiveChatForDepartment();
 
     // ---------- Sidebar rendering ----------
 
@@ -1363,7 +1490,9 @@
     function renderSidebar() {
       historyList.innerHTML = '';
 
-      if (state.order.length === 0) {
+      const visibleIds = chatsForActiveDepartment();
+
+      if (visibleIds.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'history-empty';
         empty.textContent = 'No conversations yet';
@@ -1371,7 +1500,7 @@
         return;
       }
 
-      for (const id of state.order) {
+      for (const id of visibleIds) {
         const chat = state.chats[id];
         if (!chat) continue;
 
@@ -1558,12 +1687,12 @@
     newChatBtn.addEventListener('click', () => {
       const current = getActiveChat();
       // Avoid piling up empty "New chat" entries
-      if (current && current.messages.length === 0) {
+      if (current && current.department === activeDepartment && current.messages.length === 0) {
         closeSidebarOnMobile();
         input.focus();
         return;
       }
-      createChat();
+      createChat(activeDepartment);
       renderSidebar();
       renderThread();
       updateSendButton();
@@ -1656,7 +1785,7 @@
         const res = await fetch(`${API_BASE}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message, language: languageSelect.value }),
+          body: JSON.stringify({ message, language: languageSelect.value, department: activeDepartment }),
         });
 
         const data = await res.json().catch(() => null);

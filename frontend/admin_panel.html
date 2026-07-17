@@ -278,6 +278,49 @@
     </div>
   </div>
 
+  <!-- Upload a department document (creates the department/tab if new) -->
+  <div class="overlay" id="deptOverlay">
+    <div class="modal">
+      <div class="modal-head">
+        <h3>Upload department document</h3>
+        <button class="modal-close" onclick="closeDeptModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="field">
+          <label>Department name</label>
+          <input type="text" id="f_deptName" list="deptSuggestions" placeholder="e.g. Engineering">
+          <datalist id="deptSuggestions"></datalist>
+          <div class="hint">Existing department, or type a new one to create it and its chatbot tab.</div>
+        </div>
+        <div class="field">
+          <label>PDF document</label>
+          <input type="file" id="f_deptFile" accept="application/pdf">
+        </div>
+        <div class="form-error" id="deptFormError"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-secondary" onclick="closeDeptModal()">Cancel</button>
+        <button class="btn btn-primary" id="deptUploadBtn" onclick="saveDeptUpload()">Upload &amp; train</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Manage a single department's uploaded PDFs -->
+  <div class="overlay" id="docsOverlay">
+    <div class="modal">
+      <div class="modal-head">
+        <h3 id="docsModalTitle">Documents</h3>
+        <button class="modal-close" onclick="closeDocsModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="docsList"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-secondary" onclick="closeDocsModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 const API_BASE = `http://${window.location.hostname}:5002`;
 const ALL_TABS = ["users", "queries", "files"];
@@ -293,6 +336,11 @@ function defaultTabsForRole(role) {
 }
 function authHeaders() {
   return { "Content-Type": "application/json", "Authorization": `Bearer ${localStorage.getItem('authToken') || ''}` };
+}
+function authHeadersNoContentType() {
+  // For multipart/form-data uploads — the browser must set its own
+  // Content-Type (with boundary), so it's deliberately omitted here.
+  return { "Authorization": `Bearer ${localStorage.getItem('authToken') || ''}` };
 }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -644,44 +692,146 @@ async function deleteQuery(id) {
 }
 
 /* ---------------- FILE MANAGEMENT ----------------
-   NOTE: same as above — no upload/ingestion endpoint was provided, so
-   this is a local placeholder until the RAG indexing pipeline exposes one. */
-function getFiles() { return JSON.parse(localStorage.getItem('hr_files') || '[]'); }
-function saveFiles(l) { localStorage.setItem('hr_files', JSON.stringify(l)); }
+   Backed by /departments on the same API. Uploading a PDF here creates
+   the department (and its chatbot tab) if it's new, and immediately
+   (re)builds that department's RAG index — the chatbot answers questions
+   asked in that tab strictly from the document(s) uploaded here. */
+let departmentsCache = [];
 
-function renderFilesTab(main) {
-  const files = getFiles();
+async function fetchDepartments() {
+  const res = await fetch(`${API_BASE}/departments`, { headers: authHeaders() });
+  if (!res.ok) throw new Error('Failed to load departments');
+  departmentsCache = await res.json();
+}
+
+function statusBadge(status) {
+  if (status === 'loaded') return `<span class="badge badge-active">ready</span>`;
+  if (status === 'error') return `<span class="badge badge-inactive" style="color:var(--bad)">no document</span>`;
+  return `<span class="badge badge-inactive">not loaded</span>`;
+}
+
+async function renderFilesTab(main) {
+  main.innerHTML = `<h2 class="page-title">File Management</h2><p class="page-sub">Loading departments…</p>`;
+  try {
+    await fetchDepartments();
+  } catch (err) {
+    main.innerHTML = `<h2 class="page-title">File Management</h2><div class="panel"><div class="empty-state">${ICONS.inbox}<div>Could not reach the API at ${API_BASE}. Make sure the backend is running.</div></div></div>`;
+    return;
+  }
+
   main.innerHTML = `
     <h2 class="page-title">File Management</h2>
-    <p class="page-sub">Reference material and handbook files for the assistant to draw on.</p>
-    <div class="toolbar">
-      <input type="file" id="fileInput" style="display:none" onchange="handleFileUpload(event)">
-      <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">${ICONS.upload} Upload file</button>
-    </div>
+    <p class="page-sub">Upload a department's PDF and the chatbot instantly gets a matching tab, trained on that document.</p>
+    <div class="toolbar"><button class="btn btn-primary" onclick="openDeptModal()">${ICONS.upload} Upload document</button></div>
     <div class="panel">
       <table>
-        <thead><tr><th>File name</th><th>Size</th><th>Uploaded</th><th>Action</th></tr></thead>
+        <thead><tr><th>Department</th><th>Status</th><th>Documents</th><th>Actions</th></tr></thead>
         <tbody>
-          ${files.length ? files.map(f => `
-            <tr><td>${escapeHtml(f.name)}</td><td>${f.size}</td><td>${f.date}</td>
-            <td><button class="icon-btn red" title="Delete" onclick="deleteFile('${f.id}')">${ICONS.trash}</button></td></tr>
-          `).join('') : `<tr><td colspan="4"><div class="empty-state">${ICONS.inbox}<div>No files uploaded yet.</div></div></td></tr>`}
+          ${departmentsCache.length ? departmentsCache.map(d => `
+            <tr>
+              <td style="font-weight:600">${escapeHtml(d.label)}</td>
+              <td>${statusBadge(d.status)}</td>
+              <td>${d.document_count} file${d.document_count === 1 ? '' : 's'}</td>
+              <td>
+                <div class="actions">
+                  <button class="btn btn-secondary" style="padding:6px 12px;font-size:12.5px" onclick="openDocsModal('${d.slug}','${escapeHtml(d.label)}')">Manage files</button>
+                  <button class="icon-btn red" title="Delete department" onclick="deleteDepartment('${d.slug}')">${ICONS.trash}</button>
+                </div>
+              </td>
+            </tr>
+          `).join('') : `<tr><td colspan="4"><div class="empty-state">${ICONS.inbox}<div>No departments yet — upload the first document to create one.</div></div></td></tr>`}
         </tbody>
       </table>
     </div>
   `;
 }
-function handleFileUpload(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  const files = getFiles();
-  files.push({ id: 'f' + Date.now(), name: file.name, size: Math.round(file.size / 1024) + ' KB', date: new Date().toLocaleDateString('en-GB') });
-  saveFiles(files);
+
+function openDeptModal() {
+  document.getElementById('deptFormError').textContent = '';
+  document.getElementById('f_deptName').value = '';
+  document.getElementById('f_deptFile').value = '';
+  document.getElementById('deptSuggestions').innerHTML = departmentsCache.map(d => `<option value="${escapeHtml(d.label)}">`).join('');
+  document.getElementById('deptOverlay').classList.add('open');
+}
+function closeDeptModal() { document.getElementById('deptOverlay').classList.remove('open'); }
+
+async function saveDeptUpload() {
+  const name = document.getElementById('f_deptName').value.trim();
+  const fileInput = document.getElementById('f_deptFile');
+  const file = fileInput.files[0];
+  const errEl = document.getElementById('deptFormError');
+  const btn = document.getElementById('deptUploadBtn');
+
+  if (!name) { errEl.textContent = 'Please enter a department name.'; return; }
+  if (!file) { errEl.textContent = 'Please choose a PDF file.'; return; }
+  if (!file.name.toLowerCase().endsWith('.pdf')) { errEl.textContent = 'Only PDF files are accepted.'; return; }
+
+  const form = new FormData();
+  form.append('department', name);
+  form.append('file', file);
+
+  errEl.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Uploading & training…';
+  try {
+    const res = await fetch(`${API_BASE}/departments/upload`, { method: 'POST', headers: authHeadersNoContentType(), body: form });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || 'Upload failed'); }
+    closeDeptModal();
+    renderFilesTab(document.getElementById('main'));
+  } catch (err) {
+    errEl.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Upload & train';
+  }
+}
+
+function formatBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return Math.round(n / 1024) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+let docsModalSlug = null;
+async function openDocsModal(slug, label) {
+  docsModalSlug = slug;
+  document.getElementById('docsModalTitle').textContent = `${label} — documents`;
+  document.getElementById('docsList').innerHTML = `<div class="empty-state">${ICONS.inbox}<div>Loading…</div></div>`;
+  document.getElementById('docsOverlay').classList.add('open');
+  await paintDocsList();
+}
+function closeDocsModal() { document.getElementById('docsOverlay').classList.remove('open'); }
+
+async function paintDocsList() {
+  const list = document.getElementById('docsList');
+  try {
+    const res = await fetch(`${API_BASE}/departments/${docsModalSlug}/documents`, { headers: authHeaders() });
+    if (!res.ok) throw new Error('failed');
+    const docs = await res.json();
+    list.innerHTML = docs.length ? docs.map(f => `
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--line)">
+        <div>
+          <div style="font-size:13.5px;font-weight:600">${escapeHtml(f.filename)}</div>
+          <div style="font-size:11.5px;color:var(--ink-faint)">${formatBytes(f.size_bytes)}</div>
+        </div>
+        <button class="icon-btn red" title="Delete" onclick="deleteDocument('${f.filename}')">${ICONS.trash}</button>
+      </div>
+    `).join('') : `<div class="empty-state">${ICONS.inbox}<div>No documents uploaded yet.</div></div>`;
+  } catch (err) {
+    list.innerHTML = `<div class="empty-state">${ICONS.inbox}<div>Could not load documents.</div></div>`;
+  }
+}
+
+async function deleteDocument(filename) {
+  if (!confirm(`Delete "${filename}"? The department will be re-trained on what's left.`)) return;
+  await fetch(`${API_BASE}/departments/${docsModalSlug}/documents/${encodeURIComponent(filename)}`, { method: 'DELETE', headers: authHeaders() });
+  await paintDocsList();
   renderFilesTab(document.getElementById('main'));
 }
-function deleteFile(id) {
-  if (!confirm('Delete this file?')) return;
-  saveFiles(getFiles().filter(f => f.id !== id));
+
+async function deleteDepartment(slug) {
+  if (!confirm('Delete this department and all its documents? Its chatbot tab will disappear.')) return;
+  await fetch(`${API_BASE}/departments/${slug}`, { method: 'DELETE', headers: authHeaders() });
   renderFilesTab(document.getElementById('main'));
 }
 </script>
