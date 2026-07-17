@@ -8,3 +8,5 @@ sentence-transformers
 faiss-cpu
 numpy
 deep-translator
+python-multipart
+PyJWT

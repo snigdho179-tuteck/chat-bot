@@ -143,6 +143,7 @@
     .badge { display: inline-flex; padding: 3px 11px; border-radius: 999px; font-size: 10.5px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase; }
     .badge-admin { background: var(--bad-soft); color: var(--bad); }
     .badge-hr-employee { background: var(--accent-soft); color: var(--accent); }
+    .badge-finance { background: var(--warn-soft); color: var(--warn); }
     .badge-user { background: #eef1f5; color: var(--ink-soft); }
     .badge-active { background: var(--good-soft); color: var(--good); text-transform: lowercase; }
     .badge-inactive { background: #eef1f5; color: var(--ink-soft); text-transform: lowercase; }
@@ -257,6 +258,7 @@
           <select id="f_role" onchange="onRoleChange()">
             <option value="user">User</option>
             <option value="hr-employee">HR Employee</option>
+            <option value="finance">Finance</option>
             <option value="admin">Admin</option>
           </select>
         </div>
@@ -321,6 +323,28 @@
     </div>
   </div>
 
+  <!-- Generic warning/confirm modal (used for deactivating a user) -->
+  <div class="overlay" id="confirmOverlay">
+    <div class="modal" style="max-width:400px">
+      <div class="modal-head">
+        <h3 id="confirmTitle">Are you sure?</h3>
+        <button class="modal-close" onclick="closeConfirmModal(false)">✕</button>
+      </div>
+      <div class="modal-body">
+        <div style="display:flex;gap:12px;align-items:flex-start">
+          <div style="flex-shrink:0;width:38px;height:38px;border-radius:50%;background:var(--warn-soft);color:var(--warn);display:flex;align-items:center;justify-content:center">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+          </div>
+          <p id="confirmMessage" style="margin:6px 0 0;font-size:13.5px;color:var(--ink-soft);line-height:1.5"></p>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-secondary" onclick="closeConfirmModal(false)">Cancel</button>
+        <button class="btn btn-primary" id="confirmActionBtn" style="background:linear-gradient(135deg,#e2685f,var(--bad))" onclick="closeConfirmModal(true)">Deactivate</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 const API_BASE = `http://${window.location.hostname}:5002`;
 const ALL_TABS = ["users", "queries", "files"];
@@ -373,6 +397,19 @@ const ICONS = {
 };
 
 let currentUser = null;   // { id, email, role, status, tabs } from /auth/me
+
+let _confirmResolve = null;
+function showConfirm(title, message, actionLabel) {
+  document.getElementById('confirmTitle').textContent = title;
+  document.getElementById('confirmMessage').textContent = message;
+  document.getElementById('confirmActionBtn').textContent = actionLabel || 'Confirm';
+  document.getElementById('confirmOverlay').classList.add('open');
+  return new Promise(resolve => { _confirmResolve = resolve; });
+}
+function closeConfirmModal(result) {
+  document.getElementById('confirmOverlay').classList.remove('open');
+  if (_confirmResolve) { _confirmResolve(result); _confirmResolve = null; }
+}
 let permittedTabs = [];
 let activeTab = null;
 
@@ -469,7 +506,10 @@ async function renderUsersTab(main) {
               <td style="color:var(--ink-soft);font-size:12.5px">${u.tabs.length ? u.tabs.map(t => TAB_META[t].label).join(', ') : '—'}</td>
               <td>
                 <div class="actions">
-                  <button class="icon-btn ${u.status === 'active' ? 'red' : 'green'}" title="${u.status === 'active' ? 'Deactivate' : 'Activate'}" onclick="toggleStatus('${u.id}','${u.status}')">${ICONS.shield}</button>
+                  ${u.id === currentUser.id
+                    ? `<button class="icon-btn" style="opacity:.35;cursor:not-allowed" title="You can't deactivate your own account" disabled>${ICONS.shield}</button>`
+                    : `<button class="icon-btn ${u.status === 'active' ? 'red' : 'green'}" title="${u.status === 'active' ? 'Deactivate' : 'Activate'}" onclick="toggleStatus('${u.id}','${u.status}','${escapeHtml(u.email)}')">${ICONS.shield}</button>`
+                  }
                   <button class="icon-btn blue" title="Edit" onclick='openUserModal(${JSON.stringify(u)})'>${ICONS.edit}</button>
                   <button class="icon-btn red" title="Delete" onclick="deleteUser('${u.id}')">${ICONS.trash}</button>
                 </div>
@@ -503,6 +543,11 @@ function openUserModal(u) {
   document.getElementById('f_password').placeholder = u ? 'Leave blank to keep current password' : '';
   document.getElementById('f_role').value = u ? u.role : 'user';
   document.getElementById('f_status').value = u ? u.status : 'active';
+  const isSelf = u && u.id === currentUser.id;
+  const statusSelect = document.getElementById('f_status');
+  const inactiveOption = statusSelect.querySelector('option[value="inactive"]');
+  inactiveOption.disabled = !!isSelf;
+  inactiveOption.title = isSelf ? "You can't deactivate your own account" : '';
   document.getElementById('tabsField').style.display = (u ? u.role : 'user') === 'user' ? 'none' : 'block';
   renderTabChecks(u ? u.tabs : defaultTabsForRole('user'));
   document.getElementById('userOverlay').classList.add('open');
@@ -519,6 +564,17 @@ async function saveUserForm() {
 
   try {
     if (editingUserId) {
+      if (editingUserId === currentUser.id && uiStatus === 'inactive') {
+        throw new Error("You can't deactivate your own account while logged in.");
+      }
+      if (uiStatus === 'inactive') {
+        const ok = await showConfirm(
+          'Deactivate this account?',
+          `Deactivate ${email || 'this user'}? They will be signed out immediately and won't be able to log in until reactivated.`,
+          'Deactivate'
+        );
+        if (!ok) return;
+      }
       const body = { role, status: uiStatus, tabs };
       if (password) body.password = password;
       const res = await fetch(`${API_BASE}/auth/users/${editingUserId}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify(body) });
@@ -535,9 +591,25 @@ async function saveUserForm() {
   }
 }
 
-async function toggleStatus(id, current) {
+async function toggleStatus(id, current, email) {
+  if (id === currentUser.id) {
+    alert("You can't deactivate your own account while logged in.");
+    return;
+  }
   const next = current === 'active' ? 'inactive' : 'active';
-  await fetch(`${API_BASE}/auth/users/${id}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ status: next }) });
+  if (next === 'inactive') {
+    const ok = await showConfirm(
+      'Deactivate this account?',
+      `Deactivate ${email}? They will be signed out immediately and won't be able to log in until you reactivate them.`,
+      'Deactivate'
+    );
+    if (!ok) return;
+  }
+  const res = await fetch(`${API_BASE}/auth/users/${id}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ status: next }) });
+  if (!res.ok) {
+    const d = await res.json().catch(() => ({}));
+    alert(d.detail || 'Failed to update status.');
+  }
   renderUsersTab(document.getElementById('main'));
 }
 async function deleteUser(id) {

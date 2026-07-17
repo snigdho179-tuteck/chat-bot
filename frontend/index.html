@@ -1110,6 +1110,7 @@
             <div class="p-name" id="profileName">—</div>
             <div class="p-email" id="profileEmail">—</div>
             <div><span class="p-role" id="profileRole">—</span></div>
+            <button class="logout-btn" id="profileLogoutBtn">Log out</button>
             <button class="close-btn" id="profileCloseBtn">Close</button>
           </div>
         </div>
@@ -1268,8 +1269,9 @@
       profileEmail.textContent = email || '—';
       profileRole.textContent = role || '—';
 
-      // Only hr-employee and admin accounts may open the admin panel.
-      if (role === 'admin' || role === 'hr-employee') {
+      // hr-employee, finance, and admin accounts may open the admin panel
+      // (finance/hr-employee only see it if an admin has granted them a tab).
+      if (role === 'admin' || role === 'hr-employee' || role === 'finance') {
         adminPanelMenuBtn.style.display = '';
       }
       adminPanelMenuBtn.addEventListener('click', () => {
@@ -1311,7 +1313,7 @@
         logout();
       });
 
-      //profileLogoutBtn.addEventListener('click', logout);
+      profileLogoutBtn.addEventListener('click', logout);
 
       profileCloseBtn.addEventListener('click', () => {
         profileOverlay.classList.remove('open');
