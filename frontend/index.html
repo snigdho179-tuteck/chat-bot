@@ -724,6 +724,48 @@
       font-size: 11px;
     }
 
+    .followups {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 2px 0 4px;
+    }
+
+    .followup-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 100%;
+      padding: 8px 13px;
+      font-size: 12.5px;
+      line-height: 1.4;
+      text-align: left;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border: 1px solid rgba(91, 91, 214, .18);
+      border-radius: 999px;
+      cursor: pointer;
+      transition: .16s ease;
+      white-space: normal;
+    }
+
+    .followup-chip:hover:not(:disabled) {
+      background: #fff;
+      border-color: rgba(91, 91, 214, .4);
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba(91, 91, 214, .14);
+    }
+
+    .followup-chip:disabled {
+      opacity: .5;
+      cursor: not-allowed;
+    }
+
+    .followup-chip svg {
+      flex-shrink: 0;
+      opacity: .7;
+    }
+
     .thinking {
       display: inline-flex;
       align-items: center;
@@ -1410,13 +1452,27 @@
       return 'c_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
     }
 
+    // A fresh, unguessable session id per chat, sent to the backend as
+    // `session_id` on every /chat call. A new UUID per new chat means the
+    // server's per-session conversation history starts empty instead of
+    // inheriting context from whatever chat came before it.
+    function makeSessionId() {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+      return 'sess-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    }
+
     function createChat(department) {
       const id = makeId();
       state.chats[id] = {
         id,
         department: department !== undefined ? department : activeDepartment,
+        sessionId: makeSessionId(),
         title: 'New chat',
         messages: [],
+        followUps: [],
+        followUpsLoading: false,
         updatedAt: Date.now(),
       };
       state.order.unshift(id);
@@ -1470,6 +1526,15 @@
       saveState();
       renderSidebar();
       renderThread();
+    }
+
+    // Backfill fields for chats saved by an older version of this page.
+    for (const id of state.order) {
+      const chat = state.chats[id];
+      if (!chat) continue;
+      if (!chat.sessionId) chat.sessionId = makeSessionId();
+      if (!Array.isArray(chat.followUps)) chat.followUps = [];
+      if (typeof chat.followUpsLoading !== 'boolean') chat.followUpsLoading = false;
     }
 
     // Ensure there is always at least one chat to show for the current tab
@@ -1599,6 +1664,13 @@
         }
 
         thread.appendChild(row);
+
+        // Follow-up suggestions render right after the most recent assistant
+        // message, once it's actually the last thing in the thread.
+        const isLastMessage = i === chat.messages.length - 1;
+        if (isLastMessage && msg.role === 'assistant' && !msg.isError) {
+          appendFollowUps(chat);
+        }
       }
 
       // Show the loader only in the chat that owns the pending request.
@@ -1615,6 +1687,112 @@
       }
 
       scrollToBottom();
+    }
+
+    // ---------- Follow-up suggestions ----------
+
+    function appendFollowUps(chat) {
+      if (!chat.followUpsLoading && chat.followUps.length === 0) return;
+
+      const wrap = document.createElement('div');
+      wrap.className = 'followups';
+
+      if (chat.followUpsLoading) {
+        const loading = document.createElement('button');
+        loading.className = 'followup-chip';
+        loading.disabled = true;
+        loading.innerHTML = '<span class="thinking"><span></span><span></span><span></span></span>';
+        wrap.appendChild(loading);
+      } else {
+        for (const q of chat.followUps) {
+          const chip = document.createElement('button');
+          chip.className = 'followup-chip';
+          chip.type = 'button';
+          chip.innerHTML =
+            '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6H10M10 6L6.5 2.5M10 6L6.5 9.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+            '<span></span>';
+          chip.querySelector('span').textContent = q;
+          chip.addEventListener('click', () => {
+            if (pendingRequests.has(chat.id)) return;
+            lastInputWasVoice = false;
+            sendMessage(false, q);
+          });
+          wrap.appendChild(chip);
+        }
+      }
+
+      thread.appendChild(wrap);
+    }
+
+    // Ask the assistant itself for 2-3 short follow-up questions the user
+    // could reasonably ask next, grounded in the answer it just gave. Reuses
+    // the same /chat endpoint + session_id so it has the real conversation
+    // context, but is asked to reply as pure JSON so it's easy to parse into
+    // chips.
+    async function fetchFollowUps(chatId) {
+      const chat = state.chats[chatId];
+      if (!chat) return;
+
+      chat.followUpsLoading = true;
+      chat.followUps = [];
+      if (state.activeId === chatId) renderThread();
+
+      const prompt =
+        'Based only on your previous answer, suggest 2 to 3 short, specific ' +
+        'follow-up questions I could ask next. Reply with ONLY a JSON array ' +
+        'of strings, nothing else — no numbering, no explanation. ' +
+        'Example: ["Question one?", "Question two?"]';
+
+      try {
+        const res = await fetch(`${API_BASE}/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: prompt,
+            language: languageSelect.value,
+            department: chat.department || activeDepartment,
+            session_id: chat.sessionId,
+          }),
+        });
+        const data = await res.json().catch(() => null);
+        const raw = data && typeof data.answer === 'string' ? data.answer : '';
+        chat.followUps = parseFollowUps(raw);
+      } catch (err) {
+        chat.followUps = [];
+      } finally {
+        chat.followUpsLoading = false;
+        if (state.activeId === chatId) renderThread();
+      }
+    }
+
+    function parseFollowUps(raw) {
+      if (!raw) return [];
+
+      // The model may wrap the JSON in a code fence or add stray text
+      // around it — pull out the first [...] block and parse just that.
+      const match = raw.match(/\[[\s\S]*\]/);
+      if (match) {
+        try {
+          const arr = JSON.parse(match[0]);
+          if (Array.isArray(arr)) {
+            return arr
+              .filter((q) => typeof q === 'string' && q.trim())
+              .map((q) => q.trim())
+              .slice(0, 3);
+          }
+        } catch (err) {
+          // fall through to line-based fallback below
+        }
+      }
+
+      // Fallback: treat each non-empty line as a candidate question,
+      // stripping common list markers, in case the model ignored the JSON
+      // instruction.
+      return raw
+        .split('\n')
+        .map((l) => l.replace(/^[\s\-\d.\)"']+/, '').replace(/["']+$/, '').trim())
+        .filter(Boolean)
+        .slice(0, 3);
     }
 
     function addMessageToChat(chatId, role, text, isError = false) {
@@ -1768,8 +1946,8 @@
 
     // ---------- Send flow ----------
 
-    async function sendMessage(isVoice = false) {
-      const message = input.value.trim();
+    async function sendMessage(isVoice = false, presetMessage) {
+      const message = (presetMessage !== undefined ? presetMessage : input.value).trim();
       const requestChatId = state.activeId;
 
       if (!message || !requestChatId || !state.chats[requestChatId]) return;
@@ -1777,9 +1955,19 @@
 
       // Capture the originating chat before fetch starts. The active chat can
       // change while the backend is generating its response.
+      const chat = state.chats[requestChatId];
       pendingRequests.add(requestChatId);
-      input.value = '';
-      input.style.height = 'auto';
+
+      if (presetMessage === undefined) {
+        input.value = '';
+        input.style.height = 'auto';
+      }
+
+      // Clear any follow-up chips left over from the previous answer — they
+      // no longer belong at the bottom of the thread once a new message is
+      // sent.
+      chat.followUps = [];
+      chat.followUpsLoading = false;
 
       addMessageToChat(requestChatId, 'user', message);
       updateSendButton();
@@ -1788,7 +1976,12 @@
         const res = await fetch(`${API_BASE}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message, language: languageSelect.value, department: activeDepartment }),
+          body: JSON.stringify({
+            message,
+            language: languageSelect.value,
+            department: activeDepartment,
+            session_id: chat.sessionId,
+          }),
         });
 
         const data = await res.json().catch(() => null);
@@ -1804,6 +1997,9 @@
           if (ttsEnabled) {
             speak(data.answer);
           }
+
+          // Fire-and-forget: populate follow-up suggestions for this answer.
+          fetchFollowUps(requestChatId);
         }
       } catch (err) {
         pendingRequests.delete(requestChatId);

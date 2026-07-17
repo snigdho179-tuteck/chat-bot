@@ -103,6 +103,10 @@ class Settings:
         "You are an Employee Handbook Assistant.\n\n"
         "Answer ONLY from the supplied handbook context.\n"
         "Never use your own knowledge.\n\n"
+        "Conversation history is provided for reference only, so you can "
+        "resolve follow-up questions (e.g. pronouns, 'what about...') — it "
+        "is not a source of facts. Every factual claim must still come "
+        "from the handbook context.\n\n"
         "If the context does not contain the answer,\n"
         "reply exactly:\n"
         '"I can only answer questions related to the Employee Handbook."'
@@ -118,6 +122,12 @@ class Settings:
 
     FALLBACK_ANSWER: str = "I can only answer questions related to the Employee Handbook."
 
+    # How many previous (question, answer) turns to keep per session and
+    # feed back to the model as conversation history. Kept small — this is
+    # for resolving follow-ups like "what about for contract staff?", not
+    # for long-term memory, and every turn included costs prompt tokens.
+    MAX_HISTORY_TURNS: int = int(os.environ.get("RAG_MAX_HISTORY_TURNS", "5"))
+
     # ---- llama-server process management ----
 
     # Set AUTO_START_LLAMA=false to disable and manage llama-server yourself.
@@ -131,7 +141,7 @@ class Settings:
     LLAMA_MODEL_PATH: str = os.environ.get("LLAMA_MODEL_PATH", "../models/model.gguf")
 
     # Extra CLI args passed through to llama-server (context size, threads, etc.)
-    LLAMA_EXTRA_ARGS: List[str] = os.environ.get("LLAMA_EXTRA_ARGS", "-c 4096").split()
+    LLAMA_EXTRA_ARGS: List[str] = os.environ.get("LLAMA_EXTRA_ARGS", "-c  32768").split()
 
     # How long to wait for llama-server to report healthy before giving up
     LLAMA_STARTUP_TIMEOUT: float = float(os.environ.get("LLAMA_STARTUP_TIMEOUT", "120"))
@@ -188,6 +198,17 @@ class ChatRequest(BaseModel):
             "document index + answered-query training data to search."
         ),
         examples=["hr"],
+    )
+    session_id: str = Field(
+        default="default",
+        description=(
+            "Identifies a single chat session so follow-up questions ('what "
+            "about for contract staff?') can be answered using earlier turns "
+            "as conversation history. The frontend should generate one ID per "
+            "browser session/tab and send it on every request; if omitted, "
+            "all callers share one 'default' history."
+        ),
+        examples=["b3f1c9d2-4a2e-4e9a-9a6a-6b8f6b1a9e11"],
     )
 
 
@@ -660,6 +681,65 @@ def translate_text(text: str, source_lang: str, target_lang: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Conversation history (per session, in-memory)
+# --------------------------------------------------------------------------
+#
+# Keeps the last few (question, answer) turns for each (department,
+# session_id) pair, so a follow-up question like "what about for interns?"
+# can be resolved using what was just discussed. This mirrors the
+# conv_history list from the local CLI prototype, but keyed per session
+# (rather than one global list) since the HTTP backend serves multiple
+# users/tabs concurrently, and capped at MAX_HISTORY_TURNS so it can't
+# grow without bound or crowd out the actual handbook context.
+#
+# In-memory only: history resets on restart and isn't shared across
+# multiple backend processes. That's fine for this app's single-process
+# deployment; swap in a persisted/shared store if that ever changes.
+
+class ConversationHistoryStore:
+    """Thread-safe store of recent Q&A turns per (department, session_id)."""
+
+    def __init__(self, max_turns: int = settings.MAX_HISTORY_TURNS) -> None:
+        self.max_turns = max_turns
+        self._lock = threading.Lock()
+        self._history: Dict[tuple, List[Dict[str, str]]] = {}
+
+    def _key(self, department: str, session_id: str) -> tuple:
+        return ((department or "hr").strip().lower(), (session_id or "default").strip() or "default")
+
+    def get_context(self, department: str, session_id: str) -> str:
+        """Render prior turns as text for the prompt, oldest first. Empty
+        string (not None) if there's no history yet, so callers can splice
+        it into a template unconditionally."""
+        key = self._key(department, session_id)
+        with self._lock:
+            turns = list(self._history.get(key, []))
+
+        if not turns:
+            return ""
+
+        return "\n---\n".join(f"User: {t['question']}\nAssistant: {t['answer']}" for t in turns)
+
+    def add_turn(self, department: str, session_id: str, question: str, answer: str) -> None:
+        key = self._key(department, session_id)
+        with self._lock:
+            turns = self._history.setdefault(key, [])
+            turns.append({"question": question, "answer": answer})
+            if len(turns) > self.max_turns:
+                del turns[: len(turns) - self.max_turns]
+
+    def clear(self, department: str, session_id: str) -> None:
+        """Used when the frontend starts a fresh chat / the user hits 'clear'."""
+        key = self._key(department, session_id)
+        with self._lock:
+            self._history.pop(key, None)
+
+
+# Single shared instance used by the FastAPI app
+conversation_history = ConversationHistoryStore()
+
+
+# --------------------------------------------------------------------------
 # RAG-driven answer generation
 # --------------------------------------------------------------------------
 
@@ -770,16 +850,23 @@ def _detect_smalltalk(question: str, department: str = "hr") -> Optional[str]:
     return None
 
 
-def _build_user_message(context: str, question: str) -> str:
-    """Assemble the exact user-turn prompt sent to the model."""
+def _build_user_message(context: str, question: str, history_text: str = "") -> str:
+    """Assemble the exact user-turn prompt sent to the model.
+
+    `history_text` (from ConversationHistoryStore.get_context) is inserted
+    even when empty, so the model always sees the same three-section
+    shape and there's no special-casing between a session's first message
+    and its later ones.
+    """
     return (
         f"Handbook Context:\n{context}\n\n"
+        f"Conversation History:\n{history_text or '(none yet)'}\n\n"
         f"Question:\n{question}\n\n"
         f"Answer:"
     )
 
 
-def generate_answer(question: str, language: str = "en-IN", department: str = "hr") -> str:
+def generate_answer(question: str, language: str = "en-IN", department: str = "hr", session_id: str = "default") -> str:
     """
     The full question -> answer pipeline, with translation at both ends:
 
@@ -793,6 +880,11 @@ def generate_answer(question: str, language: str = "en-IN", department: str = "h
     If RAG search finds nothing relevant, Qwen is never called — we
     return the fixed refusal message instead (also translated back).
 
+    `session_id` scopes conversation history (see ConversationHistoryStore)
+    so a follow-up question is answered with the last few turns of this
+    same session in mind. History is stored/replayed in English regardless
+    of `language`, same as the handbook context and system prompt.
+
     Raises:
         RAGNotReadyError: if the vector index hasn't finished building yet.
         LlamaServerError / LlamaServerResponseError: if llama.cpp fails.
@@ -803,7 +895,7 @@ def generate_answer(question: str, language: str = "en-IN", department: str = "h
     if english_question != question:
         logger.info("Translated incoming message %s -> en for processing.", lang_code)
 
-    answer_en = _generate_answer_en(english_question, department=department)
+    answer_en = _generate_answer_en(english_question, department=department, session_id=session_id)
 
     if lang_code == "en":
         return answer_en
@@ -814,11 +906,14 @@ def generate_answer(question: str, language: str = "en-IN", department: str = "h
     return translated_answer
 
 
-def _generate_answer_en(question: str, department: str = "hr") -> str:
+def _generate_answer_en(question: str, department: str = "hr", session_id: str = "default") -> str:
     """The original English-only pipeline: smalltalk -> RAG -> Qwen -> answer."""
     smalltalk_reply = _detect_smalltalk(question, department=department)
     if smalltalk_reply is not None:
         logger.info("Detected small talk — replying directly without RAG/Qwen.")
+        # Small talk doesn't get logged as history — it's not a handbook
+        # Q&A turn, and folding it in would just waste context on later
+        # follow-ups without helping resolve them.
         return smalltalk_reply
 
     context = rag_manager.search_context(department, question)
@@ -827,9 +922,23 @@ def _generate_answer_en(question: str, department: str = "hr") -> str:
         logger.info("No relevant context found for department '%s' — returning refusal message.", department)
         return settings.REFUSAL_MESSAGE
 
-    user_message = _build_user_message(context, question)
+    history_text = conversation_history.get_context(department, session_id)
+    user_message = _build_user_message(context, question, history_text)
+
+    print("\n" + "=" * 80)
+    print("final prompt")
+    print("=" * 80)
+    print("MESSAGE")
+    print(settings.SYSTEM_PROMPT)
+    print("\nUSER MESSAGE")
+    print(user_message)
+    print("=" * 80 + "\n")
+
     answer = llama_client.get_answer(
         system_prompt=settings.SYSTEM_PROMPT,
         user_message=user_message,
     )
+
+    conversation_history.add_turn(department, session_id, question, answer)
+
     return answer

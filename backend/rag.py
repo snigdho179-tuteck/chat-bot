@@ -96,6 +96,36 @@ class RAGSettings:
     CHUNK_SIZE: int = int(os.environ.get("RAG_CHUNK_SIZE", "900"))
     CHUNK_OVERLAP: int = int(os.environ.get("RAG_CHUNK_OVERLAP", "150"))
 
+    # "semantic" (default): sentences are grouped by embedding similarity,
+    # so a chunk boundary falls where the *topic* actually shifts instead
+    # of at an arbitrary character offset. This keeps a policy's sentences
+    # together even when it runs long, and splits earlier when the topic
+    # changes even inside what would've been one fixed-size chunk.
+    # "fixed": the original sliding-window character chunker, kept for
+    # easy rollback / comparison.
+    CHUNKING_STRATEGY: str = os.environ.get("RAG_CHUNKING_STRATEGY", "semantic").strip().lower()
+
+    # How aggressively semantic chunking splits. This is a percentile over
+    # the distribution of sentence-to-sentence semantic distances in a
+    # document: a gap bigger than this percentile of gaps is treated as a
+    # topic change and becomes a chunk boundary. Higher = fewer, larger
+    # chunks (only splits on the starkest topic shifts); lower = more,
+    # smaller chunks.
+    SEMANTIC_BREAKPOINT_PERCENTILE: float = float(
+        os.environ.get("RAG_SEMANTIC_BREAKPOINT_PERCENTILE", "90")
+    )
+
+    # Safety valve: even within one semantic "topic", force a split if the
+    # accumulated chunk would otherwise grow past this many characters, so
+    # a long uniform-topic section can't produce one giant chunk.
+    SEMANTIC_MAX_CHUNK_SIZE: int = int(
+        os.environ.get("RAG_SEMANTIC_MAX_CHUNK_SIZE", str(int(os.environ.get("RAG_CHUNK_SIZE", "900")) * 2))
+    )
+
+    # A group of sentences smaller than this (characters) gets merged into
+    # a neighboring chunk rather than kept as its own tiny fragment.
+    SEMANTIC_MIN_CHUNK_SIZE: int = int(os.environ.get("RAG_SEMANTIC_MIN_CHUNK_SIZE", "200"))
+
     EMBEDDING_MODEL_NAME: str = os.environ.get(
         "RAG_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
     )
@@ -225,19 +255,45 @@ def extract_segments_from_pdf(pdf_path: str) -> List[Tuple[str, str]]:
 
 
 def chunk_segments(
-    segments: List[Tuple[str, str]], chunk_size: int, overlap: int
+    segments: List[Tuple[str, str]],
+    chunk_size: int,
+    overlap: int,
+    embedding_model: Optional[SentenceTransformer] = None,
+    strategy: Optional[str] = None,
 ) -> List[str]:
     """
-    Turn (kind, text) segments into final chunks: "prose" segments go
-    through the normal sliding-window chunker; "table" segments are kept
-    whole, as a single chunk each, regardless of chunk_size.
+    Turn (kind, text) segments into final chunks: "table" segments are
+    always kept whole, as a single chunk each, regardless of chunk_size.
+
+    "prose" segments go through one of two chunkers:
+      - "semantic" (default, requires embedding_model): sentences are
+        grouped by embedding similarity so boundaries fall at topic
+        shifts rather than at a fixed character offset.
+      - "fixed": the original overlapping sliding-window chunker.
+
+    If strategy == "semantic" but no embedding_model is supplied, this
+    falls back to "fixed" rather than failing, so callers that haven't
+    wired up a model yet still get chunks.
     """
+    strategy = (strategy or rag_settings.CHUNKING_STRATEGY).strip().lower()
+    use_semantic = strategy == "semantic" and embedding_model is not None
+
     chunks: List[str] = []
     for kind, text in segments:
         if kind == "table":
             text = text.strip()
             if text:
                 chunks.append(text)
+        elif use_semantic:
+            chunks.extend(
+                semantic_chunk_text(
+                    text,
+                    embedding_model,
+                    max_chunk_size=rag_settings.SEMANTIC_MAX_CHUNK_SIZE,
+                    min_chunk_size=rag_settings.SEMANTIC_MIN_CHUNK_SIZE,
+                    breakpoint_percentile=rag_settings.SEMANTIC_BREAKPOINT_PERCENTILE,
+                )
+            )
         else:
             chunks.extend(chunk_text(text, chunk_size, overlap))
     return chunks
@@ -297,6 +353,131 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
         start += step
 
     return chunks
+
+
+_SENTENCE_SPLIT_RE = re.compile(
+    r"""
+    (?<=[.!?])       # split after sentence-ending punctuation
+    \s+              # followed by whitespace
+    (?=[A-Z0-9"'\(\[])  # and the next sentence looks like it starts one
+    """,
+    re.VERBOSE,
+)
+
+
+def split_into_sentences(text: str) -> List[str]:
+    """
+    Lightweight sentence splitter (no extra NLP dependency). Also treats
+    blank lines / bullet starts as boundaries, since handbook prose is
+    full of short list items that don't end in punctuation the regex
+    above would catch.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    # First split on blank lines and bullet-like line starts, then run the
+    # punctuation-based splitter on what's left of each piece.
+    rough_pieces = re.split(r"\n\s*\n|\n(?=[•\-\*]\s|\d+[\.\)]\s)", text)
+
+    sentences: List[str] = []
+    for piece in rough_pieces:
+        piece = piece.strip()
+        if not piece:
+            continue
+        for sentence in _SENTENCE_SPLIT_RE.split(piece):
+            sentence = sentence.strip()
+            if sentence:
+                sentences.append(sentence)
+
+    return sentences if sentences else [text]
+
+
+def semantic_chunk_text(
+    text: str,
+    embedding_model: SentenceTransformer,
+    max_chunk_size: int,
+    min_chunk_size: int,
+    breakpoint_percentile: float,
+) -> List[str]:
+    """
+    Split text into chunks along semantic (topic) boundaries instead of
+    fixed character offsets.
+
+    How it works:
+      1. Split the text into sentences.
+      2. Embed every sentence.
+      3. Compute the cosine distance between each consecutive pair of
+         sentence embeddings — a big jump means the topic just shifted.
+      4. Treat any distance above the given percentile of all the
+         document's own distances as a chunk boundary.
+      5. Concatenate sentences between boundaries into chunks, further
+         splitting anything that grows past max_chunk_size and merging
+         anything smaller than min_chunk_size into its neighbor.
+
+    This means a chunk boundary reflects an actual change in subject
+    matter, so a policy that runs long stays in one chunk, while a short
+    section can still get its own chunk if what follows it is unrelated —
+    instead of both being cut at an arbitrary character count.
+    """
+    sentences = split_into_sentences(text)
+    if len(sentences) <= 1:
+        stripped = text.strip()
+        return [stripped] if stripped else []
+
+    embeddings = embedding_model.encode(
+        sentences,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+
+    # Cosine distance between consecutive sentences (embeddings are
+    # normalized, so dot product == cosine similarity).
+    sims = np.einsum("ij,ij->i", embeddings[:-1], embeddings[1:])
+    distances = 1.0 - sims
+
+    if len(distances) == 0:
+        stripped = text.strip()
+        return [stripped] if stripped else []
+
+    threshold = float(np.percentile(distances, breakpoint_percentile))
+
+    # Group sentences into chunks: start a new chunk whenever the distance
+    # to the next sentence exceeds the threshold.
+    groups: List[List[str]] = [[sentences[0]]]
+    for i, distance in enumerate(distances):
+        if distance > threshold:
+            groups.append([sentences[i + 1]])
+        else:
+            groups[-1].append(sentences[i + 1])
+
+    # Merge tiny groups into a neighbor so we don't emit fragment chunks.
+    merged: List[List[str]] = []
+    for group in groups:
+        group_len = sum(len(s) for s in group)
+        if merged and group_len < min_chunk_size:
+            merged[-1].extend(group)
+        else:
+            merged.append(list(group))
+
+    # Split any still-oversized group on sentence boundaries so no single
+    # chunk blows past max_chunk_size.
+    chunks: List[str] = []
+    for group in merged:
+        current: List[str] = []
+        current_len = 0
+        for sentence in group:
+            if current and current_len + len(sentence) + 1 > max_chunk_size:
+                chunks.append(" ".join(current).strip())
+                current = []
+                current_len = 0
+            current.append(sentence)
+            current_len += len(sentence) + 1
+        if current:
+            chunks.append(" ".join(current).strip())
+
+    return [c for c in chunks if c]
 
 
 # --------------------------------------------------------------------------
@@ -538,8 +719,20 @@ class RAGSystem:
             for pdf_path in pdf_paths:
                 segments.extend(extract_segments_from_pdf(pdf_path))
 
-            logger.info("Building vector index for department '%s'...", self.department)
-            chunks = chunk_segments(segments, self.chunk_size, self.chunk_overlap)
+            # Built before chunking (rather than after) because semantic
+            # chunking needs the embedding model to score sentence-to-
+            # sentence similarity while it decides where chunk boundaries
+            # go. It's then reused below to embed the final chunks too.
+            model = SentenceTransformer(self.embedding_model_name)
+
+            logger.info(
+                "Building vector index for department '%s' (chunking_strategy=%s)...",
+                self.department,
+                rag_settings.CHUNKING_STRATEGY,
+            )
+            chunks = chunk_segments(
+                segments, self.chunk_size, self.chunk_overlap, embedding_model=model
+            )
 
             # Fold in every previously-answered query for this department so
             # they get re-indexed on every restart, not just kept in memory.
@@ -555,7 +748,6 @@ class RAGSystem:
                     "check CHUNK_SIZE/CHUNK_OVERLAP or the source documents."
                 )
 
-            model = SentenceTransformer(self.embedding_model_name)
             embeddings = model.encode(
                 chunks,
                 convert_to_numpy=True,
@@ -817,7 +1009,14 @@ class RAGSystem:
             ]
             if relevant_chunks:
                 relevant_chunks = _dedupe_overlapping_chunks(relevant_chunks)
-                return "\n\n---\n\n".join(relevant_chunks[: self.top_k])
+                final_chunks = relevant_chunks[: self.top_k]
+                logger.info(
+                    "Sending %d chunk(s) to LLM for question=%r:\n%s",
+                    len(final_chunks),
+                    question,
+                    "\n\n".join(f"--- CHUNK {i+1} ---\n{c}" for i, c in enumerate(final_chunks)),
+                )
+                return "\n\n---\n\n".join(final_chunks)
 
             logger.info("Vector scores below threshold; checking keyword fallback.")
         else:
@@ -832,7 +1031,14 @@ class RAGSystem:
                     keyword_matches[0][0],
                     question,
                 )
-                return "\n\n---\n\n".join(chunk for _, chunk in keyword_matches)
+                fallback_chunks = [chunk for _, chunk in keyword_matches]
+                logger.info(
+                    "Sending %d chunk(s) to LLM via keyword fallback for question=%r:\n%s",
+                    len(fallback_chunks),
+                    question,
+                    "\n\n".join(f"--- CHUNK {i+1} ---\n{c}" for i, c in enumerate(fallback_chunks)),
+                )
+                return "\n\n---\n\n".join(fallback_chunks)
 
         logger.info("No relevant handbook context found after vector and keyword retrieval.")
         return None
