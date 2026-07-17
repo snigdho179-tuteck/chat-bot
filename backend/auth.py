@@ -57,7 +57,7 @@ JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "dev-secret-change-me")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = int(os.environ.get("JWT_EXPIRE_HOURS", "24"))
 
-VALID_ROLES = {"user", "hr-employee", "admin"}
+VALID_ROLES = {"user", "hr-employee", "finance", "admin"}
 
 # The admin panel has three tabs. Every hr-employee/admin user carries an
 # explicit list of which ones they're allowed to see (stored as JSON in the
@@ -72,6 +72,8 @@ def default_tabs_for_role(role: str) -> List[str]:
         return list(ALL_TABS)
     if role == "hr-employee":
         return ["queries"]
+    # "finance" and plain "user" accounts get no panel tabs by default;
+    # an admin can grant specific tabs (e.g. "queries", "files") manually.
     return []
 
 
@@ -394,6 +396,12 @@ async def update_user(
     user_id: str, request: AdminUpdateUserRequest, _admin: sqlite3.Row = Depends(require_admin)
 ) -> UserOut:
     """Update a user's role, status, panel-tab access, and/or password. Admin only."""
+    if user_id == _admin["id"] and request.status is not None and request.status == "inactive":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You can't deactivate your own account while logged in.",
+        )
+
     with get_connection() as conn:
         row = conn.execute("SELECT id, email, role, status, tabs FROM users WHERE id = ?", (user_id,)).fetchone()
         if row is None:
