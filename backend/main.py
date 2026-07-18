@@ -61,6 +61,7 @@ from backend import (
     LlamaServerResponseError,
     LlamaStartupError,
     frontend_server,
+    conversation_history,
     generate_answer,
     llama_process_manager,
     logger,
@@ -176,6 +177,13 @@ async def health() -> HealthResponse:
     return HealthResponse(status="ok", vector_index=vector_index_summary, llama_server=llama_status)
 
 
+@app.delete("/chat/session/{department}/{session_id}", tags=["Chat"])
+async def reset_chat_session(department: str, session_id: str) -> dict:
+    """Clear raw turns and condensed summary for a fresh chat."""
+    conversation_history.clear(department, session_id)
+    return {"status": "cleared"}
+
+
 @app.post(
     "/chat",
     response_model=ChatResponse,
@@ -194,13 +202,22 @@ async def chat(request: ChatRequest) -> ChatResponse:
     If RAG search finds nothing relevant, the model is never called and
     a fixed refusal message is returned instead.
     """
+    if request.new_chat:
+        conversation_history.clear(request.department, request.session_id)
+        logger.info("New Chat: cleared history for %s/%s", request.department, request.session_id)
+
     logger.info(
         "Received /chat request: %r (language=%s, department=%s)",
         request.message, request.language, request.department,
     )
 
     try:
-        answer = generate_answer(request.message, language=request.language, department=request.department)
+        answer = generate_answer(
+            request.message,
+            language=request.language,
+            department=request.department,
+            session_id=request.session_id,
+        )
     except RAGNotReadyError as exc:
         logger.error("RAGNotReadyError while handling /chat: %s", exc)
         return JSONResponse(

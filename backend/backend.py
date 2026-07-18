@@ -117,8 +117,15 @@ class Settings:
     TEMPERATURE: float = 0.1
     MAX_TOKENS: int = 512
 
-    # Network timeout (seconds) for the request to llama.cpp
-    REQUEST_TIMEOUT: float = 60.0
+    # Run llama.cpp at 32K, but keep each prompt below 16K.
+    PROMPT_TOKEN_BUDGET: int = int(os.environ.get("RAG_PROMPT_TOKEN_BUDGET", "15000"))
+    HISTORY_TOKEN_BUDGET: int = int(os.environ.get("RAG_HISTORY_TOKEN_BUDGET", "3000"))
+
+    # Network timeout (seconds) for the request to llama.cpp.
+    # None = no limit (wait indefinitely for the model to finish generating).
+    # Set RAG_REQUEST_TIMEOUT (a number, in seconds) in .env to restore a cap.
+    _raw_request_timeout = os.environ.get("RAG_REQUEST_TIMEOUT", "")
+    REQUEST_TIMEOUT: Optional[float] = float(_raw_request_timeout) if _raw_request_timeout.strip() else None
 
     FALLBACK_ANSWER: str = "I can only answer questions related to the Employee Handbook."
 
@@ -127,6 +134,21 @@ class Settings:
     # for resolving follow-ups like "what about for contract staff?", not
     # for long-term memory, and every turn included costs prompt tokens.
     MAX_HISTORY_TURNS: int = int(os.environ.get("RAG_MAX_HISTORY_TURNS", "5"))
+
+    # System prompt used when condensing older conversation turns (the ones
+    # pushed out of the MAX_HISTORY_TURNS window) into a running summary,
+    # instead of just deleting them outright.
+    CONDENSE_SYSTEM_PROMPT: str = (
+        "You summarize prior turns of a conversation between a user and an "
+        "Employee Handbook Assistant.\n\n"
+        "Write a concise summary (under 150 words) that preserves any facts, "
+        "topics, or details the user established that could matter for "
+        "resolving a LATER follow-up question (e.g. which department, "
+        "employee type, or policy area they were asking about). Merge the "
+        "new turns into the existing summary rather than replacing it. "
+        "Do not answer questions or add information that wasn't in the "
+        "conversation. Reply with only the summary text, no preamble."
+    )
 
     # ---- llama-server process management ----
 
@@ -141,7 +163,7 @@ class Settings:
     LLAMA_MODEL_PATH: str = os.environ.get("LLAMA_MODEL_PATH", "../models/model.gguf")
 
     # Extra CLI args passed through to llama-server (context size, threads, etc.)
-    LLAMA_EXTRA_ARGS: List[str] = os.environ.get("LLAMA_EXTRA_ARGS", "-c  32768").split()
+    LLAMA_EXTRA_ARGS: List[str] = os.environ.get("LLAMA_EXTRA_ARGS", "--ctx-size 32768").split()
 
     # How long to wait for llama-server to report healthy before giving up
     LLAMA_STARTUP_TIMEOUT: float = float(os.environ.get("LLAMA_STARTUP_TIMEOUT", "120"))
@@ -198,6 +220,10 @@ class ChatRequest(BaseModel):
             "document index + answered-query training data to search."
         ),
         examples=["hr"],
+    )
+    new_chat: bool = Field(
+        default=False,
+        description="Clear this session before answering; send true after clicking New Chat.",
     )
     session_id: str = Field(
         default="default",
@@ -532,7 +558,7 @@ class LlamaClient:
         server_url: str = settings.LLAMA_SERVER_URL,
         temperature: float = settings.TEMPERATURE,
         max_tokens: int = settings.MAX_TOKENS,
-        timeout: float = settings.REQUEST_TIMEOUT,
+        timeout: Optional[float] = settings.REQUEST_TIMEOUT,
     ) -> None:
         self.server_url = server_url
         self.temperature = temperature
@@ -697,42 +723,106 @@ def translate_text(text: str, source_lang: str, target_lang: str) -> str:
 # deployment; swap in a persisted/shared store if that ever changes.
 
 class ConversationHistoryStore:
-    """Thread-safe store of recent Q&A turns per (department, session_id)."""
+    """
+    Thread-safe store of recent Q&A turns per (department, session_id).
+
+    Keeps up to `max_turns` raw (question, answer) pairs verbatim. Once a
+    session exceeds that, the oldest overflow turns are condensed into a
+    running per-session summary via the model (instead of being dropped
+    outright), so older context isn't lost — just compressed. get_context()
+    returns the summary (if any) followed by the still-verbatim recent turns.
+    """
 
     def __init__(self, max_turns: int = settings.MAX_HISTORY_TURNS) -> None:
         self.max_turns = max_turns
         self._lock = threading.Lock()
         self._history: Dict[tuple, List[Dict[str, str]]] = {}
+        self._summaries: Dict[tuple, str] = {}
 
     def _key(self, department: str, session_id: str) -> tuple:
         return ((department or "hr").strip().lower(), (session_id or "default").strip() or "default")
 
     def get_context(self, department: str, session_id: str) -> str:
-        """Render prior turns as text for the prompt, oldest first. Empty
-        string (not None) if there's no history yet, so callers can splice
-        it into a template unconditionally."""
+        """Render the running summary (if any) plus prior verbatim turns as
+        text for the prompt, oldest first. Empty string (not None) if there's
+        no history yet, so callers can splice it into a template
+        unconditionally."""
         key = self._key(department, session_id)
         with self._lock:
+            summary = self._summaries.get(key, "")
             turns = list(self._history.get(key, []))
 
-        if not turns:
-            return ""
+        parts: List[str] = []
+        if summary:
+            parts.append(f"Summary of earlier conversation:\n{summary}")
+        if turns:
+            parts.append(
+                "\n---\n".join(f"User: {t['question']}\nAssistant: {t['answer']}" for t in turns)
+            )
 
-        return "\n---\n".join(f"User: {t['question']}\nAssistant: {t['answer']}" for t in turns)
+        return "\n---\n".join(parts)
 
     def add_turn(self, department: str, session_id: str, question: str, answer: str) -> None:
         key = self._key(department, session_id)
+        overflow: List[Dict[str, str]] = []
         with self._lock:
             turns = self._history.setdefault(key, [])
             turns.append({"question": question, "answer": answer})
             if len(turns) > self.max_turns:
+                overflow = turns[: len(turns) - self.max_turns]
                 del turns[: len(turns) - self.max_turns]
+
+        # Condensing calls the model, so it happens outside the lock —
+        # otherwise one session's summarization call would block every
+        # other session's add_turn/get_context while it's in flight.
+        if overflow:
+            self._condense(key, overflow)
+
+    def _condense(self, key: tuple, overflow_turns: List[Dict[str, str]]) -> None:
+        """Fold `overflow_turns` (oldest-first) into the running summary for
+        `key` via the model. On any failure, logs a warning and leaves the
+        existing summary as-is — the overflow turns are still dropped from
+        the raw list either way, matching the old (pre-condensing) behavior
+        as a safe fallback rather than blocking /chat."""
+        with self._lock:
+            prior_summary = self._summaries.get(key, "")
+
+        overflow_text = "\n---\n".join(
+            f"User: {t['question']}\nAssistant: {t['answer']}" for t in overflow_turns
+        )
+        prompt = (
+            f"Existing summary:\n{prior_summary or '(none yet)'}\n\n"
+            f"New older turns to fold in (oldest first):\n{overflow_text}\n\n"
+            "Updated summary:"
+        )
+
+        try:
+            new_summary = llama_client.get_answer(
+                system_prompt=settings.CONDENSE_SYSTEM_PROMPT,
+                user_message=prompt,
+            )
+        except (LlamaServerError, LlamaServerResponseError) as exc:
+            logger.warning(
+                "History condensing failed for session (dept=%s): %s. "
+                "Keeping the previous summary as-is.",
+                key[0], exc,
+            )
+            return
+
+        new_summary = (new_summary or "").strip()
+        if not new_summary:
+            logger.warning("History condensing returned an empty summary; keeping the previous one.")
+            return
+
+        with self._lock:
+            self._summaries[key] = new_summary
 
     def clear(self, department: str, session_id: str) -> None:
         """Used when the frontend starts a fresh chat / the user hits 'clear'."""
         key = self._key(department, session_id)
         with self._lock:
             self._history.pop(key, None)
+            self._summaries.pop(key, None)
 
 
 # Single shared instance used by the FastAPI app
@@ -850,6 +940,39 @@ def _detect_smalltalk(question: str, department: str = "hr") -> Optional[str]:
     return None
 
 
+def _estimate_tokens(text: str) -> int:
+    """Conservative tokenizer-free prompt-size estimate."""
+    return 0 if not text else max(1, (len(text) + 2) // 3)
+
+
+def _truncate_to_token_budget(text: str, budget: int, keep_tail: bool = False) -> str:
+    """Trim text to an estimated token budget without splitting a word."""
+    if budget <= 0:
+        return ""
+    max_chars = budget * 3
+    if len(text) <= max_chars:
+        return text
+    marker = "\n[...content condensed/truncated to fit prompt budget...]\n"
+    usable = max(0, max_chars - len(marker))
+    chunk = text[-usable:] if keep_tail else text[:usable]
+    if keep_tail:
+        cut = chunk.find(" ")
+        return marker + (chunk[cut + 1:] if cut >= 0 else chunk)
+    cut = chunk.rfind(" ")
+    return (chunk[:cut] if cut >= 0 else chunk) + marker
+
+
+def _fit_prompt_to_budget(context: str, question: str, history_text: str) -> tuple[str, str]:
+    """Keep total prompt under 16K; retain recent history and top-ranked RAG context."""
+    fixed = _estimate_tokens(settings.SYSTEM_PROMPT) + _estimate_tokens(question) + 180
+    available = max(512, settings.PROMPT_TOKEN_BUDGET - fixed)
+    history_budget = min(settings.HISTORY_TOKEN_BUDGET, available // 3)
+    history_text = _truncate_to_token_budget(history_text, history_budget, keep_tail=True)
+    context_budget = max(256, available - _estimate_tokens(history_text))
+    context = _truncate_to_token_budget(context, context_budget)
+    return context, history_text
+
+
 def _build_user_message(context: str, question: str, history_text: str = "") -> str:
     """Assemble the exact user-turn prompt sent to the model.
 
@@ -923,7 +1046,10 @@ def _generate_answer_en(question: str, department: str = "hr", session_id: str =
         return settings.REFUSAL_MESSAGE
 
     history_text = conversation_history.get_context(department, session_id)
+    context, history_text = _fit_prompt_to_budget(context, question, history_text)
     user_message = _build_user_message(context, question, history_text)
+    estimated_prompt_tokens = _estimate_tokens(settings.SYSTEM_PROMPT) + _estimate_tokens(user_message)
+    logger.info("Prompt budget: estimated=%s, limit=%s", estimated_prompt_tokens, settings.PROMPT_TOKEN_BUDGET)
 
     print("\n" + "=" * 80)
     print("final prompt")

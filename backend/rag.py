@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import re
-import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -127,7 +126,39 @@ class RAGSettings:
     SEMANTIC_MIN_CHUNK_SIZE: int = int(os.environ.get("RAG_SEMANTIC_MIN_CHUNK_SIZE", "200"))
 
     EMBEDDING_MODEL_NAME: str = os.environ.get(
-        "RAG_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+        "RAG_EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5"
+    )
+
+    # nomic-embed-text-v1.5 is a Matryoshka model: it natively outputs 768-dim
+    # vectors but can be truncated to smaller sizes (512/256/128/64). We keep
+    # the full 768 dims. FAISS's index dimension is still taken from the
+    # actual embedding shape at build time, so this just tells the model
+    # (via SentenceTransformer's truncate_dim) what to output.
+    EMBEDDING_DIMENSION: int = int(os.environ.get("RAG_EMBEDDING_DIMENSION", "768"))
+
+    # nomic-embed-text-v1.5 requires running its bundled modeling code.
+    EMBEDDING_TRUST_REMOTE_CODE: bool = os.environ.get(
+        "RAG_EMBEDDING_TRUST_REMOTE_CODE", "true"
+    ).lower() != "false"
+
+    # nomic's embed models are instruction-prefixed: text must be prefixed
+    # with a task name ("search_document: ", "search_query: ", "clustering: ")
+    # depending on how it's being embedded, or retrieval quality drops
+    # sharply. These default to empty (no-op) for non-nomic models, and to
+    # nomic's prefixes when EMBEDDING_MODEL_NAME is a nomic model, so this
+    # never needs manual tuning when swapping the model via .env.
+    _IS_NOMIC_EMBEDDING_MODEL: bool = "nomic" in EMBEDDING_MODEL_NAME.lower()
+    EMBEDDING_DOCUMENT_PREFIX: str = os.environ.get(
+        "RAG_EMBEDDING_DOCUMENT_PREFIX",
+        "search_document: " if _IS_NOMIC_EMBEDDING_MODEL else "",
+    )
+    EMBEDDING_QUERY_PREFIX: str = os.environ.get(
+        "RAG_EMBEDDING_QUERY_PREFIX",
+        "search_query: " if _IS_NOMIC_EMBEDDING_MODEL else "",
+    )
+    EMBEDDING_CLUSTERING_PREFIX: str = os.environ.get(
+        "RAG_EMBEDDING_CLUSTERING_PREFIX",
+        "clustering: " if _IS_NOMIC_EMBEDDING_MODEL else "",
     )
 
     # Retrieve more chunks so indirect/casual wording has a better chance
@@ -171,6 +202,216 @@ class RAGDepartmentNotFoundError(RAGError):
 # --------------------------------------------------------------------------
 # Text extraction & chunking
 # --------------------------------------------------------------------------
+
+_NUMERIC_CELL_RE = re.compile(r"^[\d,./%\-\s]*\d[\d,./%\-\s]*$")
+
+
+def _looks_numeric(cell: str) -> bool:
+    """True for cells that are purely numbers/currency-ish values (e.g.
+    '4300', '10000 +', '1,200', '50%'), used to tell a header/label row
+    apart from the first row of actual data."""
+    cell = cell.strip()
+    if not cell:
+        return False
+    return bool(_NUMERIC_CELL_RE.match(cell))
+
+
+def _format_table_rows(rows: List[List[Optional[str]]]) -> str:
+    """
+    Turn PyMuPDF's table.extract() output (a list of rows, each a list of
+    cell strings/None) into a markdown-style table, preserving row/column
+    structure — instead of the old approach of dumping all the table's text
+    via page.get_text(clip=bbox), which throws away row/column association
+    entirely and interleaves every cell's text in raw reading order.
+
+    Two things this handles that a naive "row 0 = header" approach doesn't:
+
+    1. MULTI-ROW HEADERS. Tables like the Inland Travel Allowance grid have
+       a grouping header ("X Class Cities" / "Y Class cities" / "Z Class
+       cities") sitting ABOVE the real column labels ("Lodging", "Boarding",
+       "TOTAL", "Out of pocket expenses"). Treating only row 0 as the header
+       (the previous implementation) throws away which city-class each
+       column group belongs to, so a Z-class total can get reported as if
+       it were the X-class total for the same grade. All leading rows that
+       contain no numeric cells are treated as header rows and combined
+       into one compound label per column (grouping label first, then the
+       specific column label), so every column keeps its full "which
+       city-class / which measure" identity.
+
+    2. MERGED/SPANNED CELLS. A cell that visually spans multiple rows (a
+       shared grade label, a shared numeric value across two grade rows,
+       etc.) comes back from PyMuPDF as "" on every row except the one
+       where the label/value is actually printed. Each column is
+       forward-filled independently, top-to-bottom, from the nearest
+       non-empty cell above it in that SAME column. This only ever reuses
+       a value for the row(s) directly below the row that actually has it —
+       exactly what a rowspan means — and never invents a relationship
+       between two rows that aren't actually part of the same merged cell.
+       (An earlier version tried to detect "split across two physical
+       rows" by merging whole rows whenever their non-empty columns didn't
+       overlap; that guess is what glued unrelated records' numbers
+       together — e.g. attributing Grade 1A's X-class total to its Z-class
+       row. Per-column forward-fill replaces that guess entirely.)
+
+    Purely empty rows (no non-empty cell anywhere) are dropped.
+    """
+    cleaned_rows: List[List[str]] = []
+    for row in rows:
+        cleaned_rows.append([(cell or "").replace("\n", " ").strip() for cell in row])
+
+    if not cleaned_rows:
+        return ""
+
+    num_cols = max(len(r) for r in cleaned_rows)
+    for row in cleaned_rows:
+        row.extend([""] * (num_cols - len(row)))
+
+    cleaned_rows = [row for row in cleaned_rows if any(cell for cell in row)]
+    if not cleaned_rows:
+        return ""
+
+    # PyMuPDF's grid detector can over-segment a table with thin/invisible
+    # gridlines and heavy row/col-spanning into extra phantom columns.
+    # Two passes clean this up, both using only within-row evidence so
+    # nothing gets fabricated:
+    #
+    # (a) Drop columns that are blank on every single row (header rows
+    #     included) — these never carried a value in the first place.
+    #
+    # (b) Merge adjacent columns that are "mutually exclusive": if, on
+    #     every row, at most one of two neighboring columns is non-empty,
+    #     they're really one logical column whose word-wrapped text (or
+    #     wrapped header label) landed in slightly different horizontal
+    #     bins on different lines — e.g. "3T / AC" / "Chair" / "Car" each
+    #     showing up as their own near-empty column across different rows
+    #     of the same "CLASS OF TRAVEL" cell. Merging concatenates their
+    #     text per row instead of leaving the real value scattered across
+    #     several sparsely-populated columns.
+    live_cols = [c for c in range(num_cols) if any(row[c] for row in cleaned_rows)]
+    if live_cols and len(live_cols) < num_cols:
+        cleaned_rows = [[row[c] for c in live_cols] for row in cleaned_rows]
+        num_cols = len(live_cols)
+
+    merged = True
+    while merged and num_cols > 1:
+        merged = False
+        for c in range(num_cols - 1):
+            if all(not (row[c] and row[c + 1]) for row in cleaned_rows):
+                for row in cleaned_rows:
+                    combined = " ".join(p for p in (row[c], row[c + 1]) if p)
+                    row[c] = combined
+                    del row[c + 1]
+                num_cols -= 1
+                merged = True
+                break
+
+    # --- Identify all leading header rows (not just row 0) -----------------
+    # A row is still "header" as long as it has no numeric cells at all and
+    # isn't the very last row in the table. Column labels that wrap onto
+    # several lines (e.g. "Out of" / "pocket" / "expenses" as three separate
+    # extracted rows) all land here too, so the cap is generous (8 rows) —
+    # it's a safety valve against pathological tables with no data rows,
+    # not a real limit on how many header lines a table can have.
+    header_rows: List[List[str]] = [cleaned_rows[0]]
+    idx = 1
+    while (
+        idx < len(cleaned_rows) - 1
+        and len(header_rows) < 8
+        and not any(_looks_numeric(c) for c in cleaned_rows[idx])
+        and any(c for c in cleaned_rows[idx])
+    ):
+        header_rows.append(cleaned_rows[idx])
+        idx += 1
+    data_rows = cleaned_rows[idx:]
+
+    # A header row whose only non-empty cell(s) all contain the exact same
+    # text is a full-width caption (e.g. the table's overall title sitting
+    # in its own row) rather than a per-column group label. Pull those out
+    # so they don't get repeated inside every single column's label.
+    caption_lines: List[str] = []
+    group_header_rows: List[List[str]] = []
+    for hrow in header_rows:
+        distinct = {c for c in hrow if c}
+        if len(distinct) == 1:
+            caption_lines.append(next(iter(distinct)))
+        else:
+            group_header_rows.append(hrow)
+
+    # Grouping header rows (e.g. "X Class Cities") only print their label
+    # once, in the leftmost cell of the group of columns they cover, so
+    # carry it rightward across the blanks it actually spans.
+    for hrow in group_header_rows:
+        last = ""
+        for c in range(num_cols):
+            if hrow[c]:
+                last = hrow[c]
+            elif last:
+                hrow[c] = last
+
+    # Combine the (non-caption) header rows into one compound label per
+    # column, e.g. "X Class Cities Out of pocket expenses". A plain space
+    # join reads naturally whether the pieces came from a real grouping
+    # level ("X Class Cities" + "Lodging") or from a column label that
+    # simply wrapped onto several extracted rows ("Out of" / "pocket" /
+    # "expenses") — no need to tell those two cases apart.
+    combined_header: List[str] = []
+    for c in range(num_cols):
+        pieces: List[str] = []
+        seen = set()
+        for hrow in group_header_rows:
+            piece = hrow[c].strip()
+            if piece and piece not in seen:
+                pieces.append(piece)
+                seen.add(piece)
+        combined_header.append(" ".join(pieces) if pieces else f"Column {c + 1}")
+
+    caption = " ".join(caption_lines).strip()
+
+    # --- Forward-fill merged/spanned data cells, per column -----------------
+    # Only ever carries a value DOWN into the row(s) immediately below the
+    # row that actually has it — the correct semantics for a rowspan cell,
+    # and never crosses between two rows that aren't actually merged.
+    filled_rows: List[List[str]] = []
+    last_seen = [""] * num_cols
+    for row in data_rows:
+        new_row = list(row)
+        for c in range(num_cols):
+            if new_row[c]:
+                last_seen[c] = new_row[c]
+            elif last_seen[c]:
+                new_row[c] = last_seen[c]
+        # A multi-line cell (e.g. a long "CLASS OF TRAVEL" description that
+        # wraps across several lines) makes PyMuPDF emit one extra physical
+        # row per wrapped line. After forward-fill those extra rows become
+        # exact duplicates of the row above (same record, nothing new), so
+        # collapsing consecutive duplicates removes the bloat without
+        # losing any row that actually carries new information — this is
+        # also what was making responses slow, since the same row could
+        # otherwise repeat 5-8x in the context sent to the model.
+        if filled_rows and new_row == filled_rows[-1]:
+            continue
+        # A row's own label can itself wrap onto a second physical line
+        # (e.g. "Grade" then "10" as two separate extracted rows for
+        # "Grade 10"). If this row is identical to the previous one in
+        # every column except exactly one, and that one column is
+        # non-empty in both, it's that same wrap pattern — concatenate the
+        # differing column instead of keeping two rows for one record.
+        if filled_rows:
+            prev_row = filled_rows[-1]
+            diff_cols = [c for c in range(num_cols) if new_row[c] != prev_row[c]]
+            if len(diff_cols) == 1 and new_row[diff_cols[0]] and prev_row[diff_cols[0]]:
+                c = diff_cols[0]
+                prev_row[c] = f"{prev_row[c]} {new_row[c]}"
+                continue
+        filled_rows.append(new_row)
+
+    lines = [f"{caption}\n"] if caption else []
+    lines.append("| " + " | ".join(combined_header) + " |")
+    lines.append("| " + " | ".join(["---"] * num_cols) + " |")
+    for row in filled_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
 
 def extract_segments_from_pdf(pdf_path: str) -> List[Tuple[str, str]]:
     """
@@ -230,10 +471,24 @@ def extract_segments_from_pdf(pdf_path: str) -> List[Tuple[str, str]]:
                     clip_text = page.get_text(clip=table.bbox).strip()
                     if not clip_text:
                         continue
-                    table_chunk = f"[Section: {heading}]\n{clip_text}" if heading else clip_text
+
+                    try:
+                        rows = table.extract()
+                    except Exception:  # noqa: BLE001 - extraction is best-effort
+                        rows = None
+
+                    structured_text = _format_table_rows(rows) if rows else ""
+                    # Prefer the structured (row/column-preserving) rendering;
+                    # only fall back to the flat clipped text if structured
+                    # extraction produced nothing usable.
+                    body_text = structured_text or clip_text
+
+                    table_chunk = f"[Section: {heading}]\n{body_text}" if heading else body_text
                     segments.append(("table", table_chunk))
                     # Remove the table's own text from the prose remainder
                     # so it isn't also chunked (and duplicated) as prose.
+                    # Always matched against clip_text (the raw page text),
+                    # regardless of which rendering was kept above.
                     remainder = remainder.replace(clip_text, "")
 
                 remainder = remainder.strip()
@@ -292,6 +547,7 @@ def chunk_segments(
                     max_chunk_size=rag_settings.SEMANTIC_MAX_CHUNK_SIZE,
                     min_chunk_size=rag_settings.SEMANTIC_MIN_CHUNK_SIZE,
                     breakpoint_percentile=rag_settings.SEMANTIC_BREAKPOINT_PERCENTILE,
+                    embed_prefix=rag_settings.EMBEDDING_CLUSTERING_PREFIX,
                 )
             )
         else:
@@ -399,6 +655,7 @@ def semantic_chunk_text(
     max_chunk_size: int,
     min_chunk_size: int,
     breakpoint_percentile: float,
+    embed_prefix: str = "",
 ) -> List[str]:
     """
     Split text into chunks along semantic (topic) boundaries instead of
@@ -426,7 +683,7 @@ def semantic_chunk_text(
         return [stripped] if stripped else []
 
     embeddings = embedding_model.encode(
-        sentences,
+        [embed_prefix + s for s in sentences] if embed_prefix else sentences,
         convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=False,
@@ -636,6 +893,7 @@ class RAGSystem:
         chunk_size: int = rag_settings.CHUNK_SIZE,
         chunk_overlap: int = rag_settings.CHUNK_OVERLAP,
         embedding_model_name: str = rag_settings.EMBEDDING_MODEL_NAME,
+        embedding_dimension: int = rag_settings.EMBEDDING_DIMENSION,
         top_k: int = rag_settings.TOP_K,
         similarity_threshold: float = rag_settings.SIMILARITY_THRESHOLD,
     ) -> None:
@@ -648,6 +906,11 @@ class RAGSystem:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.embedding_model_name = embedding_model_name
+        self.embedding_dimension = embedding_dimension
+        self.embedding_trust_remote_code = rag_settings.EMBEDDING_TRUST_REMOTE_CODE
+        self.embedding_document_prefix = rag_settings.EMBEDDING_DOCUMENT_PREFIX
+        self.embedding_query_prefix = rag_settings.EMBEDDING_QUERY_PREFIX
+        self.embedding_clustering_prefix = rag_settings.EMBEDDING_CLUSTERING_PREFIX
         self.top_k = top_k
         self.similarity_threshold = similarity_threshold
         self.enable_keyword_fallback = rag_settings.ENABLE_KEYWORD_FALLBACK
@@ -723,7 +986,11 @@ class RAGSystem:
             # chunking needs the embedding model to score sentence-to-
             # sentence similarity while it decides where chunk boundaries
             # go. It's then reused below to embed the final chunks too.
-            model = SentenceTransformer(self.embedding_model_name)
+            model = SentenceTransformer(
+                self.embedding_model_name,
+                trust_remote_code=self.embedding_trust_remote_code,
+                truncate_dim=self.embedding_dimension,
+            )
 
             logger.info(
                 "Building vector index for department '%s' (chunking_strategy=%s)...",
@@ -749,7 +1016,7 @@ class RAGSystem:
                 )
 
             embeddings = model.encode(
-                chunks,
+                [self.embedding_document_prefix + c for c in chunks] if self.embedding_document_prefix else chunks,
                 convert_to_numpy=True,
                 normalize_embeddings=True,
                 show_progress_bar=False,
@@ -894,7 +1161,8 @@ class RAGSystem:
         assert self._embedding_model is not None and self._index is not None
 
         embedding = self._embedding_model.encode(
-            [chunk], convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False,
+            [self.embedding_document_prefix + chunk] if self.embedding_document_prefix else [chunk],
+            convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False,
         ).astype("float32")
 
         self._index.add(embedding)
@@ -917,8 +1185,9 @@ class RAGSystem:
 
     def _embed_query(self, question: str) -> np.ndarray:
         assert self._embedding_model is not None  # guarded by is_ready check in search_context
+        prefixed = self.embedding_query_prefix + question if self.embedding_query_prefix else question
         return self._embedding_model.encode(
-            [question],
+            [prefixed],
             convert_to_numpy=True,
             normalize_embeddings=True,
             show_progress_bar=False,
