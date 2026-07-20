@@ -131,6 +131,19 @@ def _row_to_query_out(row: sqlite3.Row) -> QueryOut:
         answeredAt=row["answered_at"],
     )
 
+def can_access_department(user, query_department):
+    role = (user["role"] or "").lower()
+
+    if role == "admin":
+        return True
+
+    if role == "hr-employee":
+        return query_department.lower() == "hr"
+
+    if role == "finance":
+        return query_department.lower() == "finance"
+
+    return False
 
 # --------------------------------------------------------------------------
 # Access control
@@ -208,7 +221,7 @@ async def report_query(
 async def list_queries(
     status_filter: Optional[str] = None,
     department: Optional[str] = None,
-    _user: sqlite3.Row = Depends(require_queries_tab),
+    user: sqlite3.Row = Depends(require_queries_tab),
 ) -> List[QueryOut]:
     """List reported queries, newest first.
     Optional ?status_filter=pending|answered and/or ?department=hr|marketing|..."""
@@ -227,14 +240,31 @@ async def list_queries(
     with get_connection() as conn:
         rows = conn.execute(f"SELECT * FROM queries {where} ORDER BY date DESC", params).fetchall()
 
-    return [_row_to_query_out(r) for r in rows]
+    if user["role"] == "admin":
+        filtered_rows = rows
+
+    elif user["role"] == "hr-employee":
+        filtered_rows = [
+            r for r in rows
+            if (r["department"] or "").lower() == "hr"
+        ]
+
+    elif user["role"] == "finance":
+        filtered_rows = [
+            r for r in rows
+            if (r["department"] or "").lower() == "finance"
+        ]
+
+    else:
+        filtered_rows = []
+    return [_row_to_query_out(r) for r in filtered_rows]
 
 
 @router.patch("/{query_id}", response_model=QueryOut)
 async def update_query(
     query_id: str,
     request: UpdateQueryRequest,
-    _user: sqlite3.Row = Depends(require_queries_tab),
+    user: sqlite3.Row = Depends(require_queries_tab),
 ) -> QueryOut:
     """
     Submit or edit an answer for a reported query. Called from the
@@ -264,7 +294,14 @@ async def update_query(
         conn.commit()
 
         updated = conn.execute("SELECT * FROM queries WHERE id = ?", (query_id,)).fetchone()
-
+        if not can_access_department(
+            user,
+            existing["department"]
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="You are not allowed to answer this query."
+            )
     # The moment a query newly becomes "answered" (with an actual answer),
     # fold it straight into that department's live RAG index — this is the
     # "train the bot" step, so the very next similar question in this
@@ -286,11 +323,34 @@ async def update_query(
 @router.delete("/{query_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_query(
     query_id: str,
-    _user: sqlite3.Row = Depends(require_queries_tab),
+    user: sqlite3.Row = Depends(require_queries_tab),
 ) -> None:
-    """Delete a reported query."""
+
     with get_connection() as conn:
-        result = conn.execute("DELETE FROM queries WHERE id = ?", (query_id,))
+
+        row = conn.execute(
+            "SELECT * FROM queries WHERE id = ?",
+            (query_id,)
+        ).fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Query not found."
+            )
+
+        if not can_access_department(
+            user,
+            row["department"]
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="You are not allowed to manage this query."
+            )
+
+        result = conn.execute(
+            "DELETE FROM queries WHERE id = ?",
+            (query_id,)
+        )
+
         conn.commit()
-        if result.rowcount == 0:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Query not found.")
