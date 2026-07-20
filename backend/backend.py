@@ -103,6 +103,19 @@ class Settings:
         "You are an Employee Handbook Assistant.\n\n"
         "Answer ONLY from the supplied handbook context.\n"
         "Never use your own knowledge.\n\n"
+        "The user's message may be a short topic or keyword rather than a "
+        "full question (e.g. 'Compensatory Off'). In that case, use the "
+        "Conversation History to infer what they most likely want to know "
+        "about that topic, and give a direct explanatory answer drawn from "
+        "the handbook context — do not ask them to clarify unless the "
+        "topic is genuinely ambiguous.\n\n"
+        "Always answer in plain prose sentences. NEVER respond with a "
+        "list of questions, a bullet list of FAQ-style questions, or a "
+        "JSON/array-formatted list of questions instead of an actual "
+        "answer — even if the handbook context itself contains such a "
+        "list. If the context only contains example questions about the "
+        "topic and no actual answer content, treat it as if the answer "
+        "were not found.\n\n"
         "Conversation history is provided for reference only, so you can "
         "resolve follow-up questions (e.g. pronouns, 'what about...') — it "
         "is not a source of facts. Every factual claim must still come "
@@ -940,6 +953,32 @@ def _detect_smalltalk(question: str, department: str = "hr") -> Optional[str]:
     return None
 
 
+_QUESTION_LIST_RE = re.compile(
+    r'^\s*[\[\{]?\s*["\']?[A-Z][^?]{0,200}\?["\']?\s*[,\]\}]',
+)
+
+
+def _looks_like_question_list(answer: str) -> bool:
+    """
+    Detect the failure mode where the model, given a bare topic/keyword
+    instead of a real question, echoes a JSON/array-style list of FAQ
+    questions straight out of the retrieved context instead of actually
+    answering. Heuristic: the response is short, is (or starts with) a
+    bracket/brace, and is made up mostly of question marks rather than
+    declarative sentences.
+    """
+    stripped = answer.strip()
+    if not stripped:
+        return False
+    starts_like_list = stripped[0] in "[{" or bool(_QUESTION_LIST_RE.match(stripped))
+    if not starts_like_list:
+        return False
+    question_marks = stripped.count("?")
+    # A real answer can legitimately contain a stray "?"; a dumped FAQ list
+    # is dominated by them relative to its length.
+    return question_marks >= 2 and question_marks >= stripped.count(".") 
+
+
 def _estimate_tokens(text: str) -> int:
     """Conservative tokenizer-free prompt-size estimate."""
     return 0 if not text else max(1, (len(text) + 2) // 3)
@@ -1064,6 +1103,34 @@ def _generate_answer_en(question: str, department: str = "hr", session_id: str =
         system_prompt=settings.SYSTEM_PROMPT,
         user_message=user_message,
     )
+
+    if _looks_like_question_list(answer):
+        logger.warning(
+            "Model returned a question-list instead of an answer for "
+            "question=%r; retrying once with a stricter instruction.",
+            question,
+        )
+        retry_message = (
+            user_message
+            + "\n\n(Your previous reply was a list of questions, not an "
+            "answer. Do not do that again. Write a direct, plain-prose "
+            "answer to the topic above using the handbook context. If the "
+            "context truly doesn't answer it, reply exactly: "
+            f'"{settings.REFUSAL_MESSAGE}")'
+        )
+        retried_answer = llama_client.get_answer(
+            system_prompt=settings.SYSTEM_PROMPT,
+            user_message=retry_message,
+        )
+        if not _looks_like_question_list(retried_answer):
+            answer = retried_answer
+        else:
+            logger.warning(
+                "Retry still returned a question-list for question=%r; "
+                "falling back to the refusal message.",
+                question,
+            )
+            answer = settings.REFUSAL_MESSAGE
 
     conversation_history.add_turn(department, session_id, question, answer)
 

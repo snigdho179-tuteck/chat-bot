@@ -21,6 +21,7 @@ RUN pip install --upgrade pip && \
 COPY . .
 
 EXPOSE 5003
+EXPOSE 5002
 
 WORKDIR /HR-Assistance/backend
 
